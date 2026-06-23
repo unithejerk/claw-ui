@@ -135,7 +135,7 @@ are optional but encouraged (e.g. `gateway_client`, `install`,
 `logging`).
 
 - Summary ≤72 characters, imperative mood, lowercase
-- Reference issues when applicable: `fix #2: summary of the fix`
+- Reference issues when applicable: `fix: summary of the fix (#2)`
 - Body begins one blank line after the summary; explain *why*, not *what*
 - Breaking changes: `feat!:` or `feat(scope)!:` prefix, or
   `BREAKING CHANGE:` footer

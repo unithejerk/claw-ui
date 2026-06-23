@@ -56,7 +56,7 @@ Format: `type(scope): summary` where *type* is one of `feat`, `fix`,
 `install`, `logging`).
 
 - Summary ≤72 characters, imperative mood, lowercase
-- Reference issues when applicable (`fix #42`, `closes #42`)
+- Reference issues when applicable: `fix(gateway_client): close race in reconnect loop (#42)`
 - Body begins one blank line after the summary; explain *why*, not *what*
 - Breaking changes: append `!` before the colon (`feat!:`), or add a
   `BREAKING CHANGE:` footer

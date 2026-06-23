@@ -1,9 +1,8 @@
 # Changelog
 
-All notable changes to this project follow [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
-and [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/).
-
-This project does not use SemVer yet — versions are date-based.
+All notable changes to this project follow [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html), and
+[Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/).
 
 ## [Unreleased]
 
@@ -35,4 +34,3 @@ This project does not use SemVer yet — versions are date-based.
 ### Miscellaneous
 - Standalone OpenTelemetry path removed (OWUI instance-wide OTel is the correct layer)
 - Structured event identifiers added to operational log entries
-- Branch protection enabled for main (require PR + CI + signed commits)
