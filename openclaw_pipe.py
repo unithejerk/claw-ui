@@ -225,7 +225,7 @@ class Pipe:
             gateway_error = ""
         except Exception as exc:
             logger.warning(
-                "Agent auto-discovery failed",
+                "Agent auto-discovery failed: %s", exc,
                 extra={"event": "agent_discovery_failed", "error_type": type(exc).__name__},
             )
             gateway_status = "error"
@@ -368,7 +368,7 @@ class Pipe:
                 logger.warning(
                     "Unknown agent requested: %s",
                     model_id,
-                    extra={"event": "unknown_agent", "agent_id": model_id},
+                    extra={"event": "unknown_agent", "model_id": model_id},
                 )
                 if stream:
                     return self._error_stream_generator(error_msg)
@@ -784,8 +784,8 @@ def _fire_and_forget(coro, *, label: str = "") -> None:
         exc = t.exception()
         if exc is not None:
             logger.warning(
-                "Background task %r failed",
-                label or t.get_name(),
+                "Background task %r failed: %s",
+                label or t.get_name(), exc,
                 extra={"event": "background_task_failed", "error_type": type(exc).__name__},
             )
 

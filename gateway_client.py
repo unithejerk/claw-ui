@@ -400,7 +400,7 @@ class GatewayClient:
             )
         except (GatewayConnectionError, GatewayRPCError) as exc:
             logger.warning(
-                "Approval resolve may not have reached Gateway",
+                "Approval resolve may not have reached Gateway: %s", exc,
                 extra={"event": "approval_resolve_failed", "run_id": run_id, "error_type": type(exc).__name__},
             )
 
@@ -428,7 +428,7 @@ class GatewayClient:
             )
         except (GatewayConnectionError, GatewayRPCError) as exc:
             logger.warning(
-                "Abort may not have reached Gateway",
+                "Abort may not have reached Gateway: %s", exc,
                 extra={"event": "abort_failed", "agent_id": agent_id, "error_type": type(exc).__name__},
             )
 
@@ -458,7 +458,10 @@ class GatewayClient:
 
     async def _do_connect(self) -> None:
         """Establish WebSocket and complete the connect handshake."""
-        logger.info("Connecting to Gateway at %s", self._url)
+        logger.info(
+            "Connecting to Gateway at %s", self._url,
+            extra={"event": "gateway_connecting"},
+        )
 
         try:
             self._ws = await websockets.connect(
@@ -488,7 +491,10 @@ class GatewayClient:
         self._connected = True
         self._reader_task = asyncio.create_task(self._reader_loop())
         gateway_connections().add(1)
-        logger.info("Gateway connected successfully")
+        logger.info(
+            "Gateway connected successfully",
+            extra={"event": "gateway_connected"},
+        )
 
     async def _handshake(self) -> None:
         """Complete the connect challenge handshake.
@@ -649,8 +655,8 @@ class GatewayClient:
                         return
                     except Exception as exc:
                         logger.warning(
-                            "Reconnect attempt %d failed",
-                            attempt + 1,
+                            "Reconnect attempt %d failed: %s",
+                            attempt + 1, exc,
                             extra={
                                 "event": "reconnect_attempt_failed",
                                 "attempt": attempt + 1,
@@ -723,8 +729,8 @@ class GatewayClient:
             exc = t.exception()
             if exc is not None:
                 logger.warning(
-                    "Background task %r failed",
-                    label or t.get_name(),
+                    "Background task %r failed: %s",
+                    label or t.get_name(), exc,
                     extra={"event": "background_task_failed", "error_type": type(exc).__name__},
                 )
 
