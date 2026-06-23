@@ -630,7 +630,7 @@ class GatewayClient:
                             exc,
                         )
                     finally:
-                        if self._ws:
+                        if not reconnected and self._ws:
                             try:
                                 await self._ws.close()
                             except Exception:

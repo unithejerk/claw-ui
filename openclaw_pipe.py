@@ -413,15 +413,22 @@ class Pipe:
             )
         else:
             try:
-                result = await self._nonstream_response(
+                result, agent_error = await self._nonstream_response(
                     client, agent_id, body, session_key, model_params, file_payloads,
                     __tools__, event_call=__event_call__,
                 )
-                self._gateway_status = "connected"
-                self._gateway_error = ""
-                pipe_requests().add(1, {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "success"})
-                pipe_duration().record(_time.monotonic() - t0,
-                                       {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "success"})
+                if agent_error:
+                    self._gateway_error = "Agent run failed"
+                    pipe_requests().add(1, {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "error"})
+                    pipe_duration().record(_time.monotonic() - t0,
+                                           {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "error"})
+                    span.add_event("agent.run.error")
+                else:
+                    self._gateway_status = "connected"
+                    self._gateway_error = ""
+                    pipe_requests().add(1, {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "success"})
+                    pipe_duration().record(_time.monotonic() - t0,
+                                           {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "success"})
                 span.end()
                 return result
             except GatewayConnectionError as exc:
@@ -455,17 +462,25 @@ class Pipe:
     ) -> AsyncIterator[str | dict[str, Any]]:
         """Stream agent output with span + metrics lifecycle across yields."""
         try:
+            outcome: dict = {}
             async for chunk in self._stream_response(
                 client, agent_id, body, session_key, event_emitter, model_params,
-                file_payloads, tools, event_call=event_call,
+                file_payloads, tools, event_call=event_call, outcome=outcome,
             ):
                 yield chunk
-            # Success — stream exhausted cleanly
-            self._gateway_status = "connected"
-            self._gateway_error = ""
-            pipe_requests().add(1, {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "success"})
-            pipe_duration().record(_time.monotonic() - t0,
-                                   {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "success"})
+            # Stream exhausted — branch on the raw run outcome.
+            if outcome.get("agent_error"):
+                self._gateway_error = "Agent run failed"
+                pipe_requests().add(1, {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "error"})
+                pipe_duration().record(_time.monotonic() - t0,
+                                       {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "error"})
+                span.add_event("agent.run.error")
+            else:
+                self._gateway_status = "connected"
+                self._gateway_error = ""
+                pipe_requests().add(1, {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "success"})
+                pipe_duration().record(_time.monotonic() - t0,
+                                       {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "success"})
         except GeneratorExit:
             # User cancelled — best-effort abort, fire-and-forget
             _fire_and_forget(client.abort_agent(agent_id, session_key),
@@ -503,8 +518,13 @@ class Pipe:
         tools: list[dict[str, Any]] | None = None,
         *,
         event_call: Callable | None = None,
+        outcome: dict | None = None,
     ) -> AsyncIterator[str | dict[str, Any]]:
-        """Stream agent output as SSE chunks."""
+        """Stream agent output as SSE chunks.
+
+        If *outcome* is provided it is populated with ``agent_error``
+        based on the raw terminal event captured by the stream wrapper.
+        """
         if event_emitter:
             try:
                 await event_emitter({
@@ -521,6 +541,11 @@ class Pipe:
 
         async for chunk in map_agent_events(event_stream, event_emitter=event_emitter):
             yield chunk
+
+        # Capture the raw run outcome from the wrapper so the caller
+        # can branch metrics/status without inspecting rendered chunks.
+        if outcome is not None:
+            outcome["agent_error"] = event_stream.agent_error
 
         if event_emitter:
             try:
@@ -542,8 +567,12 @@ class Pipe:
         tools: list[dict[str, Any]] | None = None,
         *,
         event_call: Callable | None = None,
-    ) -> str:
-        """Collect streaming output into a single string for non-streaming mode."""
+    ) -> tuple[str, bool]:
+        """Collect streaming output into a single string for non-streaming mode.
+
+        Returns ``(rendered_text, agent_error)`` — the bool is ``True``
+        when the Gateway reported a terminal ``status != "ok"``.
+        """
         parts: list[str] = []
 
         event_stream = self._build_agent_stream(
@@ -552,18 +581,20 @@ class Pipe:
         )
 
         async for chunk in map_agent_events(event_stream, event_emitter=None):
-            # Extract text content from SSE chunks
-            choices = chunk.get("choices", [])
-            if isinstance(chunk, dict) and choices:
+            # Extract text content from SSE chunks.
+            # Check for str first — tool calls and approval cards from
+            # the mapper are HTML strings, not dicts.
+            if isinstance(chunk, str):
+                parts.append(chunk)
+            elif isinstance(chunk, dict):
+                choices = chunk.get("choices", [])
                 for choice in choices:
                     delta = choice.get("delta", {})
                     text = delta.get("content", "")
                     if text:
                         parts.append(text)
-            elif isinstance(chunk, str):
-                parts.append(chunk)
 
-        return "".join(parts)
+        return "".join(parts), event_stream.agent_error
 
     # ------------------------------------------------------------------
     # Error handling
@@ -677,7 +708,7 @@ class Pipe:
         messages = _extract_messages(body, mode=self.valves.MESSAGE_MODE)
         system_prompt = _extract_system_prompt(body)
 
-        return client.agent_stream(
+        raw = client.agent_stream(
             agent_id=agent_id,
             messages=messages,
             session_key=session_key,
@@ -689,6 +720,36 @@ class Pipe:
             approval_timeout=self.valves.APPROVAL_TIMEOUT,
             event_call=event_call,
         )
+        return _AgentRunStream(raw)
+
+
+# ---------------------------------------------------------------------------
+# Agent run stream wrapper
+# ---------------------------------------------------------------------------
+
+
+class _AgentRunStream:
+    """Wraps a raw Gateway agent event stream and captures the terminal
+    run outcome before the mapper processes it.
+
+    This is an async iterator that yields every event through unchanged.
+    After the stream exhausts, ``agent_error`` is ``True`` when the
+    Gateway reported a terminal ``status != "ok"`` on the run, and
+    ``False`` otherwise (including when no final event arrived).
+    """
+
+    def __init__(self, raw_stream: AsyncIterator[dict[str, Any]]) -> None:
+        self._raw = raw_stream
+        self.agent_error: bool = False
+
+    def __aiter__(self) -> "_AgentRunStream":
+        return self
+
+    async def __anext__(self) -> dict[str, Any]:
+        event = await self._raw.__anext__()
+        if event.get("kind") == "final" and event.get("status", "ok") != "ok":
+            self.agent_error = True
+        return event
 
 
 # ---------------------------------------------------------------------------

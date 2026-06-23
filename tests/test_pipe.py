@@ -208,3 +208,116 @@ async def test_eager_discovery_triggered_by_pipes():
     _ = p.pipes()
     assert p._discovery_launched is True
     await asyncio.sleep(0)  # let the background task schedule
+
+
+# ── Issue 2: non-streaming string chunks do not crash ────────────────────────
+
+
+class ToolCallFakeClient(SimpleFakeClient):
+    """Yields a tool call delta (which the mapper renders as an HTML
+    string) followed by a successful final event."""
+
+    async def agent_stream(self, agent_id, messages, session_key=None, **kw):
+        yield {"kind": "delta", "delta": {"toolCall": {"name": "bash", "arguments": {"cmd": "pwd"}}}}
+        yield {"kind": "final", "status": "ok"}
+
+
+class ApprovalFakeClient(SimpleFakeClient):
+    """Yields an approval denial delta (which the mapper renders as an
+    HTML string) followed by a successful final event."""
+
+    async def agent_stream(self, agent_id, messages, session_key=None, **kw):
+        yield {"kind": "delta", "delta": {"approval_denied": True, "toolName": "rm"}}
+        yield {"kind": "final", "status": "ok"}
+
+
+async def test_nonstream_tool_call_string_no_crash():
+    """Regression for Issue 2: HTML tool-call strings from the mapper
+    must not crash _nonstream_response with AttributeError."""
+    p = _make_pipe(agent_list="default")
+    p._get_client = _fake_getter(ToolCallFakeClient())
+    result = await p.pipe({"model": "openclaw/default", "stream": False})
+    assert isinstance(result, str)
+    assert "Calling: bash" in result
+
+
+async def test_nonstream_approval_string_no_crash():
+    """Regression for Issue 2: HTML approval-denial strings from the
+    mapper must not crash _nonstream_response with AttributeError."""
+    p = _make_pipe(agent_list="default")
+    p._get_client = _fake_getter(ApprovalFakeClient())
+    result = await p.pipe({"model": "openclaw/default", "stream": False})
+    assert isinstance(result, str)
+    assert "Auto-denied" in result
+
+
+# ── Issue 3: agent-final error outcomes arc counted correctly ─────────────────
+
+
+class AgentErrorFakeClient(SimpleFakeClient):
+    """Yields a delta followed by an agent-level error final event."""
+
+    async def agent_stream(self, agent_id, messages, session_key=None, **kw):
+        yield {"kind": "delta", "delta": {"content": "trying..."}}
+        yield {"kind": "final", "status": "error", "error": "tool execution failed"}
+
+
+async def test_nonstream_agent_error_returns_error_tuple():
+    """The _nonstream_response helper returns (text, True) on agent error."""
+    p = _make_pipe(agent_list="default")
+    p._client = await _fake_getter(AgentErrorFakeClient())()
+    text, agent_error = await p._nonstream_response(
+        p._client, "default", {"messages": []}, session_key=None,
+    )
+    assert "[Error:" in text
+    assert agent_error is True
+
+
+async def test_nonstream_agent_success_returns_success_tuple():
+    """The _nonstream_response helper returns (text, False) on success."""
+    p = _make_pipe(agent_list="default")
+    p._client = await _fake_getter(SimpleFakeClient())()
+    text, agent_error = await p._nonstream_response(
+        p._client, "default", {"messages": []}, session_key=None,
+    )
+    assert "hello world" in text
+    assert agent_error is False
+
+
+async def test_nonstream_agent_error_records_error_metrics():
+    """Non-streaming pipe() records status=error for agent-run failures
+    and does NOT set _gateway_status to 'connected'."""
+    p = _make_pipe(agent_list="default")
+    p._get_client = _fake_getter(AgentErrorFakeClient())
+
+    tracer = RecordingTracer()
+    telemetry._tracer = tracer
+    try:
+        result = await p.pipe({"model": "openclaw/default", "stream": False})
+    finally:
+        telemetry._tracer = telemetry._NOOP_TRACER
+
+    # _gateway_status must NOT be "connected" (it stays "unknown" — the
+    # Gateway is fine, the run just failed).
+    assert p._gateway_status != "connected"
+    assert "Agent run failed" in p._gateway_error
+    # The error text is still surfaced to the user.
+    assert "[Error:" in result
+
+
+async def test_stream_agent_error_records_error_metrics():
+    """Streaming pipe() records status=error for agent-run failures
+    and yields the error text chunk."""
+    p = _make_pipe(agent_list="default")
+    p._get_client = _fake_getter(AgentErrorFakeClient())
+
+    stream = await p.pipe({"model": "openclaw/default", "stream": True})
+    chunks = [c async for c in stream]
+
+    # Agent error must NOT set _gateway_status to "connected".
+    assert p._gateway_status != "connected"
+    assert "Agent run failed" in p._gateway_error
+    # At least one chunk contains the error text.
+    error_chunks = [c for c in chunks if isinstance(c, dict)
+                    and c.get("choices", [{}])[0].get("delta", {}).get("content", "").startswith("\n\n[Error:")]
+    assert error_chunks

@@ -335,3 +335,66 @@ def test_route_event_queue_full_approval_handled_gracefully():
     ))
 
     assert q.qsize() == 1
+
+
+# ── Issue 1: successful reconnect survives inner finally ─────────────────────
+
+
+async def test_reconnect_successful_websocket_survives_finally():
+    """Regression for Issue 1: a successful reconnect must not have its
+    newly established websocket closed by the inner ``finally`` block."""
+    c = RoutingClient()
+    c._connected = False
+    c._max_reconnect = 1
+    c._base_delay = 0.01
+
+    class FakeWS:
+        async def close(self):
+            pass
+        async def recv(self):
+            pass
+
+    async def fake_handshake():
+        pass
+
+    async def fake_connect(*a, **kw):
+        return FakeWS()
+
+    async def fake_reader_loop():
+        pass
+
+    with _monkeypatch(c, "_handshake", fake_handshake), \
+         _monkeypatch(c, "_reader_loop", fake_reader_loop):
+        import gateway_client as _gcm
+        from unittest import mock as _m
+        with _m.patch.object(_gcm.websockets, "connect",
+                             side_effect=fake_connect):
+            await c._handle_disconnect()
+
+    # After a successful reconnect, self._ws must still be set
+    # (the inner finally must NOT have nulled it).
+    assert c._ws is not None, (
+        "self._ws is None after a successful reconnect — "
+        "the inner finally block nuked it"
+    )
+    assert c._connected is True
+    assert c._reader_task is not None
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def _monkeypatch(obj, attr_name, replacement):
+    """Temporarily patch *obj.attr_name* with *replacement*."""
+    original = getattr(obj, attr_name, None)
+    setattr(obj, attr_name, replacement)
+    try:
+        yield
+    finally:
+        if original is None:
+            delattr(obj, attr_name)
+        else:
+            setattr(obj, attr_name, original)
