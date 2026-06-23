@@ -1,0 +1,24 @@
+# Byte-compiled
+__pycache__/
+*.pyc
+*.pyo
+
+# pytest
+.pytest_cache/
+
+# Virtual environment
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+openclaw_pipe_bundle.py
