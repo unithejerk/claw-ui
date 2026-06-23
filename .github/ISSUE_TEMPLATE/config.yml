@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/unithejerk/claw-ui/security/advisories/new
+    about: Report a security issue privately — do not open a public issue.
+  - name: Open WebUI Pipe docs
+    url: https://docs.openwebui.com/features/extensibility/plugin/functions/pipe/
+    about: Documentation for Pipe Functions in Open WebUI.
+  - name: OpenClaw Gateway docs
+    url: https://docs.openclaw.ai/gateway/protocol
+    about: Documentation for the OpenClaw Gateway protocol.
