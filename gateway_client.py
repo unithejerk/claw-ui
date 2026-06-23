@@ -313,7 +313,10 @@ class GatewayClient:
             run_id = ack["runId"]
             span.set_attribute(Attr.OPENCLAW_RUN_ID, run_id)
             span.add_event("agent.run.accepted", {"runId": run_id})
-            logger.info("Agent run accepted: runId=%s agentId=%s", run_id, agent_id)
+            logger.info(
+                "Agent run accepted: runId=%s agentId=%s", run_id, agent_id,
+                extra={"event": "agent_run_accepted", "run_id": run_id, "agent_id": agent_id},
+            )
 
             # A single per-run queue carries both agent deltas and approval
             # requests, both routed by runId in _route_event.  Using one
@@ -392,10 +395,14 @@ class GatewayClient:
                 {"runId": run_id, "approved": approved},
             )
             logger.info(
-                "Approval resolved: runId=%s approved=%s", run_id, approved
+                "Approval resolved: runId=%s approved=%s", run_id, approved,
+                extra={"event": "approval_resolved", "run_id": run_id, "approved": approved},
             )
         except (GatewayConnectionError, GatewayRPCError) as exc:
-            logger.warning("Approval resolve may not have reached Gateway: %s", exc)
+            logger.warning(
+                "Approval resolve may not have reached Gateway",
+                extra={"event": "approval_resolve_failed", "run_id": run_id, "error_type": type(exc).__name__},
+            )
 
     async def abort_agent(
         self,
@@ -415,9 +422,15 @@ class GatewayClient:
             params["sessionKey"] = session_key
         try:
             await self.request("sessions.abort", params)
-            logger.info("Agent aborted: agentId=%s", agent_id)
+            logger.info(
+                "Agent aborted: agentId=%s", agent_id,
+                extra={"event": "agent_aborted", "agent_id": agent_id},
+            )
         except (GatewayConnectionError, GatewayRPCError) as exc:
-            logger.warning("Abort may not have reached Gateway: %s", exc)
+            logger.warning(
+                "Abort may not have reached Gateway",
+                extra={"event": "abort_failed", "agent_id": agent_id, "error_type": type(exc).__name__},
+            )
 
     async def list_agents(self) -> list[dict[str, str]]:
         """Discover available agents from the Gateway.
@@ -433,7 +446,10 @@ class GatewayClient:
                 for a in agents
             ]
         except GatewayRPCError:
-            logger.warning("agents.list RPC failed; falling back to default agent")
+            logger.warning(
+                "agents.list RPC failed; falling back to default agent",
+                extra={"event": "agent_list_failed"},
+            )
             return [{"id": "default", "name": "Default"}]
 
     # ------------------------------------------------------------------
@@ -585,16 +601,21 @@ class GatewayClient:
                 delay = self._base_delay * (2 ** attempt)
                 logger.info(
                     "Reconnecting in %.1fs (attempt %d/%d)",
-                    delay,
-                    attempt + 1,
-                    self._max_reconnect,
+                    delay, attempt + 1, self._max_reconnect,
+                    extra={
+                        "event": "reconnect_scheduled",
+                        "attempt": attempt + 1,
+                        "max_attempts": self._max_reconnect,
+                        "delay_s": delay,
+                    },
                 )
                 await asyncio.sleep(delay)
 
                 async with self._connect_lock:
                     if self._connected:
                         logger.info(
-                            "Another task already reconnected; exiting"
+                            "Another task already reconnected; exiting",
+                            extra={"event": "reconnect_already_connected"},
                         )
                         reconnected = True
                         return
@@ -613,7 +634,10 @@ class GatewayClient:
                             self._reader_loop()
                         )
                         gateway_connections().add(1)  # reconnected
-                        logger.info("Reconnected successfully")
+                        logger.info(
+                            "Reconnected successfully",
+                            extra={"event": "reconnect_succeeded"},
+                        )
                         reconnected = True
 
                         # Signal all run subscribers that their runs
@@ -625,9 +649,13 @@ class GatewayClient:
                         return
                     except Exception as exc:
                         logger.warning(
-                            "Reconnect attempt %d failed: %s",
+                            "Reconnect attempt %d failed",
                             attempt + 1,
-                            exc,
+                            extra={
+                                "event": "reconnect_attempt_failed",
+                                "attempt": attempt + 1,
+                                "error_type": type(exc).__name__,
+                            },
                         )
                     finally:
                         if not reconnected and self._ws:
@@ -637,7 +665,10 @@ class GatewayClient:
                                 pass
                             self._ws = None
 
-            logger.error("All reconnect attempts exhausted")
+            logger.error(
+                "All reconnect attempts exhausted",
+                extra={"event": "reconnect_exhausted", "max_attempts": self._max_reconnect},
+            )
         finally:
             if not reconnected:
                 self._fail_run_subscribers(
@@ -670,6 +701,7 @@ class GatewayClient:
                 logger.debug(
                     "Run subscriber queue full; dropping terminal event: %s",
                     error_message,
+                    extra={"event": "queue_full_drop", "drop_type": "terminal"},
                 )
 
     # ------------------------------------------------------------------
@@ -691,7 +723,9 @@ class GatewayClient:
             exc = t.exception()
             if exc is not None:
                 logger.warning(
-                    "Background task %r failed: %s", label or t.get_name(), exc
+                    "Background task %r failed",
+                    label or t.get_name(),
+                    extra={"event": "background_task_failed", "error_type": type(exc).__name__},
                 )
 
         task.add_done_callback(_on_done)
@@ -842,6 +876,7 @@ class GatewayClient:
             logger.warning(
                 "Unknown approval mode '%s' for run %s; auto-denying",
                 mode, run_id,
+                extra={"event": "unknown_approval_mode", "approval_mode": mode, "run_id": run_id},
             )
             self._safe_task(
                 self.resolve_approval(run_id, False),
@@ -890,6 +925,7 @@ class GatewayClient:
                     logger.warning(
                         "Run subscriber queue full for run %s; dropping final event",
                         run_id,
+                        extra={"event": "queue_full_drop", "run_id": run_id, "drop_type": "final"},
                     )
             else:
                 # Error
@@ -904,6 +940,7 @@ class GatewayClient:
                     logger.warning(
                         "Run subscriber queue full for run %s; dropping error event",
                         run_id,
+                        extra={"event": "queue_full_drop", "run_id": run_id, "drop_type": "error"},
                     )
             return
 
@@ -948,6 +985,7 @@ class GatewayClient:
                     logger.warning(
                         "Run subscriber queue full for run %s; dropping delta event",
                         run_id,
+                        extra={"event": "queue_full_drop", "run_id": run_id, "drop_type": "delta"},
                     )
                 return
 
@@ -968,6 +1006,7 @@ class GatewayClient:
                     logger.warning(
                         "Run subscriber queue full for run %s; dropping approval event",
                         run_id,
+                        extra={"event": "queue_full_drop", "run_id": run_id, "drop_type": "approval"},
                     )
                 return
             # No active subscriber for this runId — drop.
@@ -979,4 +1018,7 @@ class GatewayClient:
                 payload["_event_type"] = event_name.replace(".", "_")
                 queue.put_nowait(payload)
             except asyncio.QueueFull:
-                logger.debug("Event queue full for %s; dropping event", event_name)
+                logger.debug(
+                    "Event queue full for %s; dropping event", event_name,
+                    extra={"event": "event_queue_full_drop", "event_name": event_name},
+                )

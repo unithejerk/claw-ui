@@ -203,13 +203,20 @@ calls from Pipe modules become OTel log records.
 | Logger | Level | Example |
 |---|---|---|
 | `openclaw_pipe` | INFO | `"Gateway connected successfully"` |
-| `openclaw_pipe.gateway_client` | INFO | `"Agent run accepted: runId=..."` |
+| `openclaw_pipe.gateway_client` | INFO | `"Agent run accepted: runId=..."` (carries ``event="agent_run_accepted"``) |
 | `openclaw_pipe.telemetry` | INFO | `"Telemetry: piggybacking on Open WebUI OTel"` |
-| `openclaw_pipe.event_mapper` | DEBUG | `"Unknown event kind: ..."` |
+| `openclaw_pipe.event_mapper` | DEBUG | `"Unknown event kind: ..."` (carries ``event="unknown_event_kind"``) |
 
 Logs are **automatically correlated** with the active trace and span via
 OTel context propagation — in your tracing backend, clicking on a span
 shows all log lines emitted during that span.  No extra plumbing needed.
+
+Operational log entries carry a structured ``event`` field (e.g.
+``"agent_run_accepted"``, ``"reconnect_succeeded"``,
+``"queue_full_drop"``) and context keys such as ``run_id``,
+``agent_id``, ``attempt``, and ``error_type`` in the log record
+attributes, making them queryable in the OTel backend without
+parsing message text.
 
 `DEBUG`-level logs stay local (not exported) to keep log volume manageable.
 Only `INFO`, `WARNING`, `ERROR`, and `CRITICAL` are exported.

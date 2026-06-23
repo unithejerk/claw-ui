@@ -61,7 +61,10 @@ async def map_agent_events(
                 yield chunk
 
         else:
-            logger.debug("Unknown event kind: %s", kind)
+            logger.debug(
+                "Unknown event kind: %s", kind,
+                extra={"event": "unknown_event_kind", "kind": kind},
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +110,10 @@ async def _map_delta(
                 },
             })
         except Exception:
-            logger.debug("event_emitter call failed for thinking status")
+            logger.debug(
+                "event_emitter call failed for thinking status",
+                extra={"event": "emitter_failed", "status_type": "thinking"},
+            )
 
     # Explicit status steps
     if status and event_emitter:
@@ -120,7 +126,10 @@ async def _map_delta(
                 },
             })
         except Exception:
-            logger.debug("event_emitter call failed for step status")
+            logger.debug(
+                "event_emitter call failed for step status",
+                extra={"event": "emitter_failed", "status_type": "step"},
+            )
 
 
 def _map_final(event: dict[str, Any]) -> dict[str, Any]:

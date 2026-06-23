@@ -224,7 +224,10 @@ class Pipe:
             gateway_status = "connected"
             gateway_error = ""
         except Exception as exc:
-            logger.warning("Agent auto-discovery failed: %s", exc)
+            logger.warning(
+                "Agent auto-discovery failed",
+                extra={"event": "agent_discovery_failed", "error_type": type(exc).__name__},
+            )
             gateway_status = "error"
             gateway_error = "Agent discovery failed — check Gateway configuration"
             agents = [{"id": "default", "name": "Default"}]
@@ -362,7 +365,11 @@ class Pipe:
                     f"Unknown agent '{model_id}'. Available: "
                     + ", ".join(sorted(known))
                 )
-                logger.warning(error_msg)
+                logger.warning(
+                    "Unknown agent requested: %s",
+                    model_id,
+                    extra={"event": "unknown_agent", "agent_id": model_id},
+                )
                 if stream:
                     return self._error_stream_generator(error_msg)
                 return error_msg
@@ -777,7 +784,9 @@ def _fire_and_forget(coro, *, label: str = "") -> None:
         exc = t.exception()
         if exc is not None:
             logger.warning(
-                "Background task %r failed: %s", label or t.get_name(), exc
+                "Background task %r failed",
+                label or t.get_name(),
+                extra={"event": "background_task_failed", "error_type": type(exc).__name__},
             )
 
     task.add_done_callback(_on_done)
@@ -924,7 +933,10 @@ def _format_error(exc: BaseException) -> str:
     elif isinstance(exc, GatewayRPCError):
         return f"OpenClaw request failed: {exc}"
     else:
-        logger.exception("Unexpected error in pipe()")
+        logger.exception(
+            "Unexpected error in pipe()",
+            extra={"event": "pipe_unexpected_error"},
+        )
         return f"OpenClaw Pipe error: {exc}"
 
 
