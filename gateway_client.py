@@ -664,6 +664,7 @@ class GatewayClient:
                     "kind": "final",
                     "status": "error",
                     "error": error_message,
+                    "_local": True,
                 })
             except asyncio.QueueFull:
                 logger.debug(

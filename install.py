@@ -206,17 +206,21 @@ class OWUIClient:
                 return False
             raise
 
-    def create_or_update(self, fid: str, content: str, meta: dict | None = None) -> dict:
-        """Create or update a Pipe Function with *content* as its source."""
+    def create_or_update(self, fid: str, content: str, meta: dict | None = None) -> tuple[dict, bool]:
+        """Create or update a Pipe Function with *content* as its source.
+
+        Returns ``(response, created)`` — *created* is ``True`` when the
+        function did not previously exist and was freshly created.
+        """
         meta = meta or {}
         meta.setdefault("name", FUNCTION_NAME)
         meta.setdefault("description", "OpenClaw agents as selectable models.")
         body = {"id": fid, "content": content, "meta": meta}
         if self.function_exists(fid):
             print(f"   ↳ Updating existing function '{fid}' ...", file=sys.stderr)
-            return self._req("POST", f"/id/{fid}/update", body)
+            return self._req("POST", f"/id/{fid}/update", body), False
         print(f"   ↳ Creating new function '{fid}' ...", file=sys.stderr)
-        return self._req("POST", "/create", body)
+        return self._req("POST", "/create", body), True
 
     def set_valves(self, fid: str, valves: dict) -> dict:
         """Set admin-level Valves for *fid*."""
@@ -333,6 +337,15 @@ def main() -> None:
     output = bool(args.output)
     check_only = args.check
 
+    # ── Validate partial direct-install args ─────────────────────────
+    if bool(args.owui_url) != bool(args.owui_key):
+        print(
+            "❌ Both --owui-url and --owui-key are required for direct "
+            "install.  Omit both for bundle mode.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     # ── Build bundle ──────────────────────────────────────────────
     print("📦 Bundling OpenClaw Pipe ...", file=sys.stderr)
     bundle = build_bundle()
@@ -349,7 +362,7 @@ def main() -> None:
 
         print(f"\n🔑 Authenticating to {args.owui_url} ...", file=sys.stderr)
         try:
-            client.create_or_update(args.owui_id, bundle)
+            _, created = client.create_or_update(args.owui_id, bundle)
         except RuntimeError as exc:
             print(f"❌ {exc}", file=sys.stderr)
             sys.exit(1)
@@ -377,12 +390,18 @@ def main() -> None:
                 file=sys.stderr,
             )
 
-        # Enable
-        try:
-            client.enable(args.owui_id)
-            print(f"   ✅ Function enabled.", file=sys.stderr)
-        except RuntimeError as exc:
-            print(f"   ⚠️  Enable toggle failed: {exc}", file=sys.stderr)
+        # Enable — only toggle for newly created functions.  Updates
+        # preserve the existing enabled state (the OWUI /toggle endpoint
+        # flips is_active, so re-running against an already-enabled
+        # function would disable it).
+        if created:
+            try:
+                client.enable(args.owui_id)
+                print(f"   ✅ Function enabled.", file=sys.stderr)
+            except RuntimeError as exc:
+                print(f"   ⚠️  Enable toggle failed: {exc}", file=sys.stderr)
+        else:
+            print("   ℹ️  Function already exists; enable state unchanged.", file=sys.stderr)
 
         print(f"\n✅ Done.  Select 'OpenClaw/Default' in the model selector.", file=sys.stderr)
         return

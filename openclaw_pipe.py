@@ -749,7 +749,11 @@ class _AgentRunStream:
 
     async def __anext__(self) -> dict[str, Any]:
         event = await self._raw.__anext__()
-        if event.get("kind") == "final" and event.get("status", "ok") != "ok":
+        if (
+            event.get("kind") == "final"
+            and event.get("status", "ok") != "ok"
+            and not event.get("_local")
+        ):
             self.agent_error = True
         return event
 

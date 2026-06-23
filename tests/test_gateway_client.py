@@ -249,6 +249,45 @@ def test_fail_run_subscribers_pushes_final_error_to_queue():
     assert ev["kind"] == "final"
     assert ev["status"] == "error"
     assert ev["error"] == "connection lost"
+    assert ev.get("_local") is True, "synthetic events must carry _local marker"
+
+
+# ── Issue 2: synthetic disconnect events not misclassified ───────────────────
+
+
+async def test_synthetic_local_events_not_agent_error():
+    """_AgentRunStream must NOT set agent_error for synthetic local
+    terminal events from _fail_run_subscribers (disconnect path)."""
+    from openclaw_pipe import _AgentRunStream
+
+    async def fake_raw():
+        yield {"kind": "delta", "delta": {"content": "hi"}}
+        yield {"kind": "final", "status": "error", "error": "conn lost",
+               "_local": True}
+
+    stream = _AgentRunStream(fake_raw())
+    chunks = [c async for c in stream]
+    assert len(chunks) == 2
+    assert stream.agent_error is False, (
+        "synthetic local disconnect event must not set agent_error"
+    )
+
+
+async def test_real_gateway_error_still_sets_agent_error():
+    """_AgentRunStream MUST set agent_error for real Gateway terminal
+    errors (no _local marker)."""
+    from openclaw_pipe import _AgentRunStream
+
+    async def fake_raw():
+        yield {"kind": "delta", "delta": {"content": "trying"}}
+        yield {"kind": "final", "status": "error", "error": "tool failed"}
+
+    stream = _AgentRunStream(fake_raw())
+    chunks = [c async for c in stream]
+    assert len(chunks) == 2
+    assert stream.agent_error is True, (
+        "real Gateway terminal error must set agent_error"
+    )
 
 
 # ── _safe_task ─────────────────────────────────────────────────────────────
