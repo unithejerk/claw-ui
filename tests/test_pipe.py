@@ -69,6 +69,17 @@ class RecordingTracer:
         return RecordingSpan()
 
 
+class RecordingCounter:
+    """Captures every ``add(amount, attributes)`` call so tests can
+    assert that the right metric branch was taken."""
+
+    def __init__(self):
+        self.calls: list[tuple[float, dict]] = []
+
+    def add(self, amount: float = 1, attributes: dict | None = None) -> None:
+        self.calls.append((amount, attributes or {}))
+
+
 def _make_pipe(agent_list="__auto__", prefix="OpenClaw/"):
     p = Pipe()
     p.valves = p.Valves(AGENT_LIST=agent_list, AGENT_PREFIX=prefix)
@@ -285,39 +296,67 @@ async def test_nonstream_agent_success_returns_success_tuple():
 
 
 async def test_nonstream_agent_error_records_error_metrics():
-    """Non-streaming pipe() records status=error for agent-run failures
-    and does NOT set _gateway_status to 'connected'."""
+    """Non-streaming pipe() records status=error and sets gateway
+    status to 'connected' (the Gateway is reachable — the run just
+    failed)."""
     p = _make_pipe(agent_list="default")
     p._get_client = _fake_getter(AgentErrorFakeClient())
 
-    tracer = RecordingTracer()
-    telemetry._tracer = tracer
+    counter = RecordingCounter()
+    telemetry._counter_pipe_requests = counter
     try:
         result = await p.pipe({"model": "openclaw/default", "stream": False})
     finally:
-        telemetry._tracer = telemetry._NOOP_TRACER
+        telemetry._counter_pipe_requests = telemetry._NoOpCounter()
 
-    # _gateway_status must NOT be "connected" (it stays "unknown" — the
-    # Gateway is fine, the run just failed).
-    assert p._gateway_status != "connected"
+    # Gateway IS reachable — we got a valid terminal response.
+    assert p._gateway_status == "connected"
     assert "Agent run failed" in p._gateway_error
-    # The error text is still surfaced to the user.
     assert "[Error:" in result
+    # The error-accounting branch was taken.
+    error_calls = [c for c in counter.calls
+                   if c[1].get("openclaw.agent.id") == "default"
+                   and c[1].get("status") == "error"]
+    assert error_calls, "pipe_requests counter must record status=error"
 
 
 async def test_stream_agent_error_records_error_metrics():
-    """Streaming pipe() records status=error for agent-run failures
-    and yields the error text chunk."""
+    """Streaming pipe() records status=error and sets gateway status
+    to 'connected' (the Gateway is reachable — the run just failed)."""
     p = _make_pipe(agent_list="default")
     p._get_client = _fake_getter(AgentErrorFakeClient())
 
-    stream = await p.pipe({"model": "openclaw/default", "stream": True})
-    chunks = [c async for c in stream]
+    counter = RecordingCounter()
+    telemetry._counter_pipe_requests = counter
+    try:
+        stream = await p.pipe({"model": "openclaw/default", "stream": True})
+        chunks = [c async for c in stream]
+    finally:
+        telemetry._counter_pipe_requests = telemetry._NoOpCounter()
 
-    # Agent error must NOT set _gateway_status to "connected".
-    assert p._gateway_status != "connected"
+    assert p._gateway_status == "connected"
     assert "Agent run failed" in p._gateway_error
-    # At least one chunk contains the error text.
     error_chunks = [c for c in chunks if isinstance(c, dict)
                     and c.get("choices", [{}])[0].get("delta", {}).get("content", "").startswith("\n\n[Error:")]
     assert error_chunks
+    error_calls = [c for c in counter.calls
+                   if c[1].get("openclaw.agent.id") == "default"
+                   and c[1].get("status") == "error"]
+    assert error_calls, "pipe_requests counter must record status=error"
+
+
+async def test_agent_error_resets_stale_gateway_status():
+    """A successful Gateway response (even with agent-run error) must
+    overwrite a stale _gateway_status from a prior transport failure."""
+    p = _make_pipe(agent_list="default")
+    p._get_client = _fake_getter(AgentErrorFakeClient())
+    # Simulate a prior transport failure leaving stale state.
+    p._gateway_status = "error"
+    p._gateway_error = "prior transport error"
+
+    result = await p.pipe({"model": "openclaw/default", "stream": False})
+
+    # The stale "error" must be replaced — the Gateway responded.
+    assert p._gateway_status == "connected"
+    assert p._gateway_error == "Agent run failed"
+    assert "[Error:" in result

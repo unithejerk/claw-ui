@@ -418,6 +418,7 @@ class Pipe:
                     __tools__, event_call=__event_call__,
                 )
                 if agent_error:
+                    self._gateway_status = "connected"
                     self._gateway_error = "Agent run failed"
                     pipe_requests().add(1, {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "error"})
                     pipe_duration().record(_time.monotonic() - t0,
@@ -470,6 +471,7 @@ class Pipe:
                 yield chunk
             # Stream exhausted — branch on the raw run outcome.
             if outcome.get("agent_error"):
+                self._gateway_status = "connected"
                 self._gateway_error = "Agent run failed"
                 pipe_requests().add(1, {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "error"})
                 pipe_duration().record(_time.monotonic() - t0,
