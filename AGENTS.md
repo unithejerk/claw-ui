@@ -128,7 +128,15 @@ without updating the bundler's `MODULES` list.
 
 ## Commit style
 
-- Imperative, lowercase, ≤72 char subject
-- Reference issue numbers when applicable (e.g. "fix #2: task leak in
-  agent_stream consumer loop")
+Follow [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/).
+Format: `type(scope): summary`.  Types: `feat`, `fix`, `docs`, `style`,
+`refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`.  Scopes
+are optional but encouraged (e.g. `gateway_client`, `install`,
+`logging`).
+
+- Summary ≤72 characters, imperative mood, lowercase
+- Reference issues when applicable: `fix #2: summary of the fix`
+- Body begins one blank line after the summary; explain *why*, not *what*
+- Breaking changes: `feat!:` or `feat(scope)!:` prefix, or
+  `BREAKING CHANGE:` footer
 - Co-authored-by trailers welcome for AI-assisted changes

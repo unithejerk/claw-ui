@@ -47,9 +47,19 @@ Add or update tests for any behaviour change.
 
 ## Commit style
 
-- Imperative, lowercase, ≤72 character subject line
-- Reference issue numbers when applicable
-- Body should explain *why*, not *what*
+Follow [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/).
+Commits are linted in CI via commitlint.
+
+Format: `type(scope): summary` where *type* is one of `feat`, `fix`,
+`docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`,
+`revert`. Scopes are optional but encouraged (e.g. `gateway_client`,
+`install`, `logging`).
+
+- Summary ≤72 characters, imperative mood, lowercase
+- Reference issues when applicable (`fix #42`, `closes #42`)
+- Body begins one blank line after the summary; explain *why*, not *what*
+- Breaking changes: append `!` before the colon (`feat!:`), or add a
+  `BREAKING CHANGE:` footer
 
 ## PR checklist
 
