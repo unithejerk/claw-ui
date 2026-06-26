@@ -149,15 +149,20 @@ def build_request(
     Side-effecting methods (``send``, ``agent``) should include an
     idempotency key so Gateway can safely deduplicate retries.
     """
-    frame: dict[str, Any] = {
+    # idempotencyKey is a *params* field (e.g. AgentParamsSchema requires
+    # it there), NOT a frame-level field — RequestFrameSchema is
+    # additionalProperties:false and has no top-level idempotencyKey, so a
+    # frame-level copy would be rejected and the required params copy would
+    # be missing.
+    frame_params: dict[str, Any] = dict(params or {})
+    if idempotency_key:
+        frame_params["idempotencyKey"] = idempotency_key
+    return json.dumps({
         "type": FrameType.REQ,
         "id": request_id or generate_request_id(),
         "method": method,
-        "params": params or {},
-    }
-    if idempotency_key:
-        frame["idempotencyKey"] = idempotency_key
-    return json.dumps(frame)
+        "params": frame_params,
+    })
 
 
 def build_connect(
@@ -166,7 +171,7 @@ def build_connect(
     token: str,
     challenge_nonce: str,
     challenge_ts: str,
-    client_id: str = "openwebui-pipe",
+    client_id: str = "gateway-client",
     client_version: str = "1.0.0",
     client_platform: str = "open-webui",
 ) -> str:
@@ -188,7 +193,12 @@ def build_connect(
         the Pipe does not sign the challenge (see :func:`sign_challenge`).
         Kept so a future device-keypair auth path can consume them without
         changing the call site.
-    client_id, client_version, client_platform:
+    client_id:
+        Gateway client identity.  Must be one of the
+        ``GatewayClientIdSchema`` enum values (the schema is a strict
+        enum, ``additionalProperties:false``); ``"gateway-client"`` is the
+        generic backend-integration identity.
+    client_version, client_platform:
         Reported to the Gateway as the client identity.
     """
     return json.dumps({
@@ -204,8 +214,15 @@ def build_connect(
                 "platform": client_platform,
                 "mode": "backend",
             },
+            # caps advertise optional client capabilities to the Gateway.
+            # "tool-events" is required for the Gateway to direct agent
+            # tool/item stream events to this connection (otherwise the
+            # Pipe never sees tool-call activity to render as cards).
+            "caps": ["tool-events"],
             "role": "operator",
-            "scopes": ["operator.read", "operator.write"],
+            # operator.approvals is required to call exec.approval.resolve /
+            # plugin.approval.resolve when resolving agent tool approvals.
+            "scopes": ["operator.read", "operator.write", "operator.approvals"],
             "auth": {"token": token},
         },
     })

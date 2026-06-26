@@ -97,11 +97,14 @@ opposite: user → Open WebUI → agent.  The roles are reversed.
 ## Approval flow
 
 When an OpenClaw agent wants to run a tool that requires user approval, the
-Gateway sends an ``approval.requested`` event.  The Pipe resolves it according
-to ``APPROVAL_MODE``:
+Gateway sends an ``agent`` event with ``stream: "approval"`` and
+``data.phase: "requested"``.  The Pipe resolves it according to
+``APPROVAL_MODE`` via the ``exec.approval.resolve`` (or
+``plugin.approval.resolve``) RPC, which takes ``{id, decision}`` and
+requires the ``operator.approvals`` scope:
 
 ```
-Gateway ── approval.requested ──► Pipe ──► OWUI browser
+Gateway ── agent stream="approval" phase="requested" ──► Pipe ──► OWUI browser
                                     │
   auto_deny:    ◄── deny  ──────────┤
   auto_approve: ◄── allow ──────────┤

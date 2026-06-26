@@ -17,7 +17,7 @@ via OWUI's REST API (stdlib-only, no extra deps).
 
 4. **Gateway auth token.**  If they don't have one:
    ```bash
-   openclaw gateway token create --scopes operator.read,operator.write
+   openclaw gateway token create --scopes operator.read,operator.write,operator.approvals
    ```
    If `openclaw` isn't available (Docker/systemd), ask how they manage the
    Gateway and help generate a token through that path.

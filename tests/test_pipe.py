@@ -29,8 +29,8 @@ class SimpleFakeClient:
     async def connect(self):
         pass
 
-    async def agent_stream(self, agent_id, messages, session_key=None, **kw):
-        yield {"kind": "delta", "delta": {"content": "hello world"}}
+    async def agent_stream(self, agent_id, message, session_key=None, **kw):
+        yield {"kind": "delta", "stream": "assistant", "data": {"delta": "hello world"}}
         yield {"kind": "final", "status": "ok"}
 
     async def abort_agent(self, *a, **k):
@@ -225,20 +225,26 @@ async def test_eager_discovery_triggered_by_pipes():
 
 
 class ToolCallFakeClient(SimpleFakeClient):
-    """Yields a tool call delta (which the mapper renders as an HTML
+    """Yields a tool/item event (which the mapper renders as an HTML
     string) followed by a successful final event."""
 
-    async def agent_stream(self, agent_id, messages, session_key=None, **kw):
-        yield {"kind": "delta", "delta": {"toolCall": {"name": "bash", "arguments": {"cmd": "pwd"}}}}
+    async def agent_stream(self, agent_id, message, session_key=None, **kw):
+        yield {"kind": "delta", "stream": "tool", "data": {
+            "itemId": "i1", "phase": "start", "kind": "tool",
+            "title": "bash", "status": "running", "toolCallId": "c1",
+        }}
         yield {"kind": "final", "status": "ok"}
 
 
 class ApprovalFakeClient(SimpleFakeClient):
-    """Yields an approval denial delta (which the mapper renders as an
+    """Yields an approval resolution event (which the mapper renders as an
     HTML string) followed by a successful final event."""
 
-    async def agent_stream(self, agent_id, messages, session_key=None, **kw):
-        yield {"kind": "delta", "delta": {"approval_denied": True, "toolName": "rm"}}
+    async def agent_stream(self, agent_id, message, session_key=None, **kw):
+        yield {"kind": "delta", "stream": "approval", "data": {
+            "phase": "resolved", "status": "denied", "title": "rm",
+            "kind": "exec", "reason": "Auto-denied by Pipe",
+        }}
         yield {"kind": "final", "status": "ok"}
 
 
@@ -253,12 +259,13 @@ async def test_nonstream_tool_call_string_no_crash():
 
 
 async def test_nonstream_approval_string_no_crash():
-    """Regression for Issue 2: HTML approval-denial strings from the
-    mapper must not crash _nonstream_response with AttributeError."""
+    """Regression for Issue 2: HTML approval strings from the mapper
+    must not crash _nonstream_response with AttributeError."""
     p = _make_pipe(agent_list="default")
     p._get_client = _fake_getter(ApprovalFakeClient())
     result = await p.pipe({"model": "openclaw/default", "stream": False})
     assert isinstance(result, str)
+    assert "Denied" in result
     assert "Auto-denied" in result
 
 
@@ -268,8 +275,8 @@ async def test_nonstream_approval_string_no_crash():
 class AgentErrorFakeClient(SimpleFakeClient):
     """Yields a delta followed by an agent-level error final event."""
 
-    async def agent_stream(self, agent_id, messages, session_key=None, **kw):
-        yield {"kind": "delta", "delta": {"content": "trying..."}}
+    async def agent_stream(self, agent_id, message, session_key=None, **kw):
+        yield {"kind": "delta", "stream": "assistant", "data": {"delta": "trying..."}}
         yield {"kind": "final", "status": "error", "error": "tool execution failed"}
 
 

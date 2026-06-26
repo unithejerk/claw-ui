@@ -41,6 +41,7 @@ from telemetry import (
     pipe_requests,
     record_exception_on_span,
     shutdown_telemetry,
+    use_span,
 )
 
 logger = logging.getLogger("openclaw_pipe")
@@ -313,9 +314,13 @@ class Pipe:
             (confirmation dialogs, etc.).
         __files__:
             List of uploaded file metadata dicts with keys
-            like ``name``, ``mimeType``, ``data``, etc.
+            like ``name``, ``mimeType``, ``data``, etc.  Forwarded to the
+            Gateway agent RPC as ``attachments``.
         __tools__:
-            List of tool definitions available to the agent.
+            List of tool definitions available to the agent.  **Not
+            forwarded** — ``AgentParamsSchema`` (protocol v4) has no
+            ``tools`` field and rejects unknown fields; the Gateway agent
+            uses its own configured tools.
 
         Returns
         -------
@@ -371,7 +376,7 @@ class Pipe:
                     extra={"event": "unknown_agent", "model_id": model_id},
                 )
                 if stream:
-                    return self._error_stream_generator(error_msg)
+                    return _error_stream_generator(error_msg)
                 return error_msg
 
         # Start the root span for this request.
@@ -395,8 +400,13 @@ class Pipe:
         # if session_key:
         #     span.set_attribute(Attr.OPENCLAW_SESSION_KEY, session_key)
 
-        model_params = _extract_model_params(body)
-        file_payloads = _extract_file_payloads(__files__)
+        # AgentParamsSchema (protocol v4) accepts a single `message`
+        # string plus optional `extraSystemPrompt` / `attachments`.  OWUI
+        # tool definitions (__tools__) and OAI model params are not
+        # forwardable — the Gateway agent uses its own tools and rejects
+        # unknown fields (additionalProperties:false) — so they are
+        # intentionally dropped here.
+        attachments = _extract_file_payloads(__files__)
 
         # Emit initial status
         if __event_emitter__:
@@ -416,39 +426,40 @@ class Pipe:
         if stream:
             return self._traced_stream_response(
                 client, agent_id, body, session_key, __event_emitter__, __event_call__,
-                span, t0, model_params, file_payloads, __tools__,
+                span, t0, attachments,
             )
         else:
-            try:
-                result, agent_error = await self._nonstream_response(
-                    client, agent_id, body, session_key, model_params, file_payloads,
-                    __tools__, event_call=__event_call__,
-                )
-                if agent_error:
-                    self._gateway_status = "connected"
-                    self._gateway_error = "Agent run failed"
-                    pipe_requests().add(1, {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "error"})
-                    pipe_duration().record(_time.monotonic() - t0,
-                                           {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "error"})
-                    span.add_event("agent.run.error")
-                else:
-                    self._gateway_status = "connected"
-                    self._gateway_error = ""
-                    pipe_requests().add(1, {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "success"})
-                    pipe_duration().record(_time.monotonic() - t0,
-                                           {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "success"})
-                span.end()
-                return result
-            except GatewayConnectionError as exc:
-                self._gateway_status = "error"
-                self._gateway_error = str(exc)[:120]
-                self._finalize_span_with_error(span, exc, agent_id, t0)
-                error_msg = _format_error(exc)
-                return error_msg
-            except (GatewayRPCError, Exception) as exc:
-                self._finalize_span_with_error(span, exc, agent_id, t0)
-                error_msg = _format_error(exc)
-                return error_msg
+            with use_span(span):
+                try:
+                    result, agent_error = await self._nonstream_response(
+                        client, agent_id, body, session_key, attachments,
+                        event_call=__event_call__,
+                    )
+                    if agent_error:
+                        self._gateway_status = "connected"
+                        self._gateway_error = "Agent run failed"
+                        pipe_requests().add(1, {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "error"})
+                        pipe_duration().record(_time.monotonic() - t0,
+                                               {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "error"})
+                        span.add_event("agent.run.error")
+                    else:
+                        self._gateway_status = "connected"
+                        self._gateway_error = ""
+                        pipe_requests().add(1, {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "success"})
+                        pipe_duration().record(_time.monotonic() - t0,
+                                               {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "success"})
+                    span.end()
+                    return result
+                except GatewayConnectionError as exc:
+                    self._gateway_status = "error"
+                    self._gateway_error = str(exc)[:120]
+                    self._finalize_span_with_error(span, exc, agent_id, t0)
+                    error_msg = _format_error(exc)
+                    return error_msg
+                except (GatewayRPCError, Exception) as exc:
+                    self._finalize_span_with_error(span, exc, agent_id, t0)
+                    error_msg = _format_error(exc)
+                    return error_msg
 
     # ------------------------------------------------------------------
     # Streaming
@@ -464,56 +475,59 @@ class Pipe:
         event_call: Callable | None,
         span: Any,
         t0: float,
-        model_params: dict[str, Any] | None = None,
-        file_payloads: list[dict[str, Any]] | None = None,
-        tools: list[dict[str, Any]] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[str | dict[str, Any]]:
         """Stream agent output with span + metrics lifecycle across yields."""
-        try:
-            outcome: dict = {}
-            async for chunk in self._stream_response(
-                client, agent_id, body, session_key, event_emitter, model_params,
-                file_payloads, tools, event_call=event_call, outcome=outcome,
-            ):
-                yield chunk
-            # Stream exhausted — branch on the raw run outcome.
-            if outcome.get("agent_error"):
-                self._gateway_status = "connected"
-                self._gateway_error = "Agent run failed"
-                pipe_requests().add(1, {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "error"})
+        # Activate the root span as current so GatewayClient child spans
+        # (connect / request:agent / agent_stream) nest under openclaw.pipe.
+        # The sync context manager is held across yields; the no-op case
+        # (telemetry disabled) is a pass-through.
+        with use_span(span):
+            try:
+                outcome: dict = {}
+                async for chunk in self._stream_response(
+                    client, agent_id, body, session_key, event_emitter, attachments,
+                    event_call=event_call, outcome=outcome,
+                ):
+                    yield chunk
+                # Stream exhausted — branch on the raw run outcome.
+                if outcome.get("agent_error"):
+                    self._gateway_status = "connected"
+                    self._gateway_error = "Agent run failed"
+                    pipe_requests().add(1, {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "error"})
+                    pipe_duration().record(_time.monotonic() - t0,
+                                           {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "error"})
+                    span.add_event("agent.run.error")
+                else:
+                    self._gateway_status = "connected"
+                    self._gateway_error = ""
+                    pipe_requests().add(1, {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "success"})
+                    pipe_duration().record(_time.monotonic() - t0,
+                                           {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "success"})
+            except GeneratorExit:
+                # User cancelled — best-effort abort, fire-and-forget
+                _fire_and_forget(client.abort_agent(agent_id, session_key),
+                                label="abort_agent")
+                pipe_requests().add(1, {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "cancelled"})
                 pipe_duration().record(_time.monotonic() - t0,
-                                       {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "error"})
-                span.add_event("agent.run.error")
-            else:
-                self._gateway_status = "connected"
-                self._gateway_error = ""
-                pipe_requests().add(1, {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "success"})
-                pipe_duration().record(_time.monotonic() - t0,
-                                       {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "success"})
-        except GeneratorExit:
-            # User cancelled — best-effort abort, fire-and-forget
-            _fire_and_forget(client.abort_agent(agent_id, session_key),
-                            label="abort_agent")
-            pipe_requests().add(1, {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "cancelled"})
-            pipe_duration().record(_time.monotonic() - t0,
-                                   {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "cancelled"})
-            span.add_event("pipe.cancelled")
+                                       {Attr.OPENCLAW_AGENT_ID: agent_id, Attr.STATUS: "cancelled"})
+                span.add_event("pipe.cancelled")
+                span.end()
+                return
+            except GatewayConnectionError as exc:
+                self._gateway_status = "error"
+                self._gateway_error = str(exc)[:120]
+                self._finalize_span_with_error(span, exc, agent_id, t0)
+                error_msg = _format_error(exc)
+                yield _error_chunk(error_msg)
+                return
+            except (GatewayRPCError, Exception) as exc:
+                self._finalize_span_with_error(span, exc, agent_id, t0)
+                # Yield the error as content so the UI shows it
+                error_msg = _format_error(exc)
+                yield _error_chunk(error_msg)
+                return
             span.end()
-            return
-        except GatewayConnectionError as exc:
-            self._gateway_status = "error"
-            self._gateway_error = str(exc)[:120]
-            self._finalize_span_with_error(span, exc, agent_id, t0)
-            error_msg = _format_error(exc)
-            yield _error_chunk(error_msg)
-            return
-        except (GatewayRPCError, Exception) as exc:
-            self._finalize_span_with_error(span, exc, agent_id, t0)
-            # Yield the error as content so the UI shows it
-            error_msg = _format_error(exc)
-            yield _error_chunk(error_msg)
-            return
-        span.end()
 
     async def _stream_response(
         self,
@@ -522,9 +536,7 @@ class Pipe:
         body: dict[str, Any],
         session_key: str | None,
         event_emitter: Callable | None,
-        model_params: dict[str, Any] | None = None,
-        file_payloads: list[dict[str, Any]] | None = None,
-        tools: list[dict[str, Any]] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
         *,
         event_call: Callable | None = None,
         outcome: dict | None = None,
@@ -544,8 +556,8 @@ class Pipe:
                 pass
 
         event_stream = self._build_agent_stream(
-            client, agent_id, body, session_key, model_params,
-            file_payloads, tools, event_call=event_call,
+            client, agent_id, body, session_key, attachments,
+            event_call=event_call,
         )
 
         async for chunk in map_agent_events(event_stream, event_emitter=event_emitter):
@@ -571,9 +583,7 @@ class Pipe:
         agent_id: str,
         body: dict[str, Any],
         session_key: str | None,
-        model_params: dict[str, Any] | None = None,
-        file_payloads: list[dict[str, Any]] | None = None,
-        tools: list[dict[str, Any]] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
         *,
         event_call: Callable | None = None,
     ) -> tuple[str, bool]:
@@ -585,8 +595,8 @@ class Pipe:
         parts: list[str] = []
 
         event_stream = self._build_agent_stream(
-            client, agent_id, body, session_key, model_params,
-            file_payloads, tools, event_call=event_call,
+            client, agent_id, body, session_key, attachments,
+            event_call=event_call,
         )
 
         async for chunk in map_agent_events(event_stream, event_emitter=None):
@@ -701,30 +711,29 @@ class Pipe:
         agent_id: str,
         body: dict[str, Any],
         session_key: str | None,
-        model_params: dict[str, Any] | None = None,
-        file_payloads: list[dict[str, Any]] | None = None,
-        tools: list[dict[str, Any]] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
         *,
         event_call: Callable | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Build and return a Gateway agent event stream.
 
-        Factors out the duplicated ``_extract_messages``,
+        Factors out the ``_extract_agent_message``,
         ``_extract_system_prompt``, and ``client.agent_stream(…)``
-        call that was previously inlined in both ``_stream_response``
-        and ``_nonstream_response``.
+        call shared by ``_stream_response`` and ``_nonstream_response``.
+
+        The agent RPC takes a single ``message`` string (the Gateway
+        session holds prior history), an optional ``extraSystemPrompt``,
+        and optional ``attachments`` — see ``AgentParamsSchema``.
         """
-        messages = _extract_messages(body, mode=self.valves.MESSAGE_MODE)
-        system_prompt = _extract_system_prompt(body)
+        message = _extract_agent_message(body, mode=self.valves.MESSAGE_MODE)
+        extra_system_prompt = _extract_system_prompt(body)
 
         raw = client.agent_stream(
             agent_id=agent_id,
-            messages=messages,
+            message=message,
             session_key=session_key,
-            system_prompt=system_prompt,
-            model_params=model_params,
-            files=file_payloads,
-            tools=tools,
+            extra_system_prompt=extra_system_prompt,
+            attachments=attachments,
             approval_mode=self.valves.APPROVAL_MODE,
             approval_timeout=self.valves.APPROVAL_TIMEOUT,
             event_call=event_call,
@@ -839,52 +848,73 @@ def _build_session_key(
     return ":".join(parts) if len(parts) > 2 else None
 
 
-def _extract_messages(
+def _extract_agent_message(
     body: dict[str, Any],
     *,
     mode: str = "last",
-) -> list[dict[str, Any]]:
-    """Extract conversation messages from the request body.
+) -> str:
+    """Return the single ``message`` string to send to the Gateway agent RPC.
 
-    In ``last`` mode (the default) only the newest user message is sent
-    — Gateway is stateful and already has the full conversation in its
-    session.  ``full`` mode sends the complete message history.
+    ``AgentParamsSchema`` (protocol v4) takes one ``message`` string; the
+    Gateway session holds the prior conversation history.  In ``last``
+    mode (the default) this is the newest user message.  In ``full`` mode
+    the conversation is flattened into a ``role: content`` transcript
+    string — the RPC cannot accept a message list, so this is the only
+    way to forward history to a stateless backend.
     """
     messages = body.get("messages", [])
-    if mode == "last" and messages:
-        # Find the last user message and send only that.
-        for msg in reversed(messages):
-            if msg.get("role") == "user":
-                return [msg]
-        return [messages[-1]]  # fallback: no user message found
-    return messages
+    if not messages:
+        return ""
+
+    if mode == "full":
+        lines: list[str] = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            text = _coerce_text(msg.get("content", ""))
+            if text:
+                lines.append(f"{role}: {text}")
+        return "\n".join(lines)
+
+    # last — newest user message (Gateway session has the rest).
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            return _coerce_text(msg.get("content", ""))
+    # No user message — fall back to the last message of any role.
+    return _coerce_text(messages[-1].get("content", ""))
 
 
-_MODEL_PARAM_KEYS = (
-    "temperature", "top_p", "max_tokens", "stop",
-    "frequency_penalty", "presence_penalty", "seed",
-)
+def _coerce_text(content: Any) -> str:
+    """Coerce an OWUI message ``content`` value to a plain string.
 
-
-def _extract_model_params(body: dict[str, Any]) -> dict[str, Any]:
-    """Extract model parameters from the request body.
-
-    Forwards known OAI-compatible params that the Gateway agent RPC
-    accepts.  ``None`` values are skipped.
+    Open WebUI content may be a string or a list of content parts
+    (``[{"type": "text", "text": "…"}, …]``); concatenate the text parts.
     """
-    params: dict[str, Any] = {}
-    for key in _MODEL_PARAM_KEYS:
-        if key in body and body[key] is not None:
-            params[key] = body[key]
-    return params
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                text = part.get("text") or part.get("content") or ""
+                if text:
+                    parts.append(str(text))
+            elif isinstance(part, str):
+                parts.append(part)
+        return "".join(parts)
+    if content is None:
+        return ""
+    return str(content)
 
 
 def _extract_system_prompt(body: dict[str, Any]) -> str | None:
-    """Pull the system prompt if one is set in the messages."""
+    """Pull the system prompt if one is set in the messages.
+
+    Mapped to the agent RPC's ``extraSystemPrompt`` parameter.
+    """
     messages = body.get("messages", [])
     for msg in messages:
         if msg.get("role") == "system":
-            return msg.get("content")
+            return _coerce_text(msg.get("content"))
     return None
 
 

@@ -29,8 +29,12 @@ def test_build_request_basic_shape():
 
 
 def test_build_request_idempotency_key_included_when_given():
+    # idempotencyKey is a *params* field (AgentParamsSchema requires it
+    # there), not a frame-level field (RequestFrameSchema is
+    # additionalProperties:false with no top-level idempotencyKey).
     frame = json.loads(build_request("agent", {"a": 1}, idempotency_key="k-1"))
-    assert frame["idempotencyKey"] == "k-1"
+    assert frame["params"]["idempotencyKey"] == "k-1"
+    assert "idempotencyKey" not in frame  # never at the frame top level
 
 
 def test_build_request_uses_provided_request_id():
@@ -117,6 +121,12 @@ def test_build_connect_token_only_no_device_signature():
     assert frame["params"]["minProtocol"] == protocol.PROTOCOL_VERSION
     assert frame["params"]["maxProtocol"] == protocol.PROTOCOL_VERSION
     assert frame["params"]["role"] == "operator"
+    # client.id must be a GatewayClientIdSchema enum value (strict enum).
+    assert frame["params"]["client"]["id"] == "gateway-client"
+    assert frame["params"]["client"]["mode"] == "backend"
+    # tool-events cap + operator.approvals scope for approval resolution.
+    assert frame["params"]["caps"] == ["tool-events"]
+    assert "operator.approvals" in frame["params"]["scopes"]
 
 
 def test_sign_challenge_is_deterministic_hmac():

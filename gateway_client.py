@@ -207,7 +207,7 @@ class GatewayClient:
         request_id = generate_request_id()
         idem_key = generate_idempotency_key() if idempotent else None
 
-        future: asyncio.Future[dict[str, Any]] = asyncio.get_event_loop().create_future()
+        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
 
         tracer = get_tracer()
@@ -244,22 +244,22 @@ class GatewayClient:
     async def agent_stream(
         self,
         agent_id: str,
-        messages: list[dict[str, Any]],
+        message: str,
         session_key: str | None = None,
         *,
-        system_prompt: str | None = None,
-        model_params: dict[str, Any] | None = None,
-        files: list[dict[str, Any]] | None = None,
-        tools: list[dict[str, Any]] | None = None,
+        extra_system_prompt: str | None = None,
+        attachments: list[dict[str, Any]] | None = None,
         approval_mode: str = "auto_deny",
         approval_timeout: int = 30,
         event_call: Callable | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Run an agent and yield streaming events as they arrive.
 
-        Each yielded dict represents a Gateway agent event payload.
-        The caller (``event_mapper``) translates these into Open WebUI
-        SSE chunks.
+        Each yielded dict represents a Gateway agent event payload
+        (an ``AgentEventPayload`` discriminated by ``stream``), plus a
+        terminal ``kind="final"`` event when the run's final ``res``
+        frame arrives.  The caller (``event_mapper``) translates these
+        into Open WebUI SSE chunks.
 
         The stream ends when the Gateway sends the final result response,
         or when an error occurs.
@@ -282,20 +282,22 @@ class GatewayClient:
         # if session_key:
         #     span.set_attribute(Attr.OPENCLAW_SESSION_KEY, session_key)
 
+        # AgentParamsSchema (protocol v4) is additionalProperties:false.
+        # It takes a single `message` string — the Gateway session holds
+        # prior conversation history — plus optional agentId/sessionKey/
+        # extraSystemPrompt/attachments.  Do NOT forward messages/
+        # systemPrompt/files/tools or OAI model params; the Gateway
+        # rejects unknown fields.
         params: dict[str, Any] = {
             "agentId": agent_id,
-            "messages": messages,
+            "message": message,
         }
         if session_key:
             params["sessionKey"] = session_key
-        if system_prompt:
-            params["systemPrompt"] = system_prompt
-        if model_params:
-            params.update(model_params)
-        if files:
-            params["files"] = files
-        if tools:
-            params["tools"] = tools
+        if extra_system_prompt:
+            params["extraSystemPrompt"] = extra_system_prompt
+        if attachments:
+            params["attachments"] = attachments
 
         run_id: str | None = None
 
@@ -379,29 +381,39 @@ class GatewayClient:
 
     async def resolve_approval(
         self,
-        run_id: str,
+        approval_id: str,
         approved: bool,
+        *,
+        kind: str = "exec",
     ) -> None:
-        """Resolve a pending approval request for *run_id*.
+        """Resolve a pending approval request.
+
+        Agent tool approvals arrive in the agent event stream as
+        ``stream=="approval"`` events whose ``data`` carries an
+        ``approvalId`` and ``kind`` (``"exec"`` / ``"plugin"`` /
+        ``"unknown"``).  The Gateway resolves them via the
+        ``exec.approval.resolve`` (or ``plugin.approval.resolve``) RPC,
+        which takes ``{id, decision}`` where ``decision`` is
+        ``"allow-once"`` / ``"allow-always"`` / ``"deny"`` and requires
+        the ``operator.approvals`` scope.
 
         Best-effort — errors are swallowed with a warning.
-        No-op if not connected.
+        No-op if not connected or *approval_id* is empty.
         """
-        if not self._connected:
+        if not self._connected or not approval_id:
             return
+        method = "plugin.approval.resolve" if kind == "plugin" else "exec.approval.resolve"
+        decision = "allow-once" if approved else "deny"
         try:
-            await self.request(
-                "approval.resolve",
-                {"runId": run_id, "approved": approved},
-            )
+            await self.request(method, {"id": approval_id, "decision": decision})
             logger.info(
-                "Approval resolved: runId=%s approved=%s", run_id, approved,
-                extra={"event": "approval_resolved", "run_id": run_id, "approved": approved},
+                "Approval resolved: id=%s decision=%s", approval_id, decision,
+                extra={"event": "approval_resolved", "approval_id": approval_id, "decision": decision},
             )
         except (GatewayConnectionError, GatewayRPCError) as exc:
             logger.warning(
                 "Approval resolve may not have reached Gateway: %s", exc,
-                extra={"event": "approval_resolve_failed", "run_id": run_id, "error_type": type(exc).__name__},
+                extra={"event": "approval_resolve_failed", "approval_id": approval_id, "error_type": type(exc).__name__},
             )
 
     async def abort_agent(
@@ -411,25 +423,25 @@ class GatewayClient:
     ) -> None:
         """Best-effort abort of a running agent.
 
-        Sends ``sessions.abort`` RPC with a short timeout.  Errors are
-        swallowed (logged as warnings) — this is fire-and-forget.
-        No-op if the client is not connected.
+        Sends the ``sessions.abort`` RPC.  Per ``SessionsAbortParamsSchema``
+        the params are ``{key?, runId?}`` — *key* is the session key;
+        *agentId* is not a valid field.  Errors are swallowed (logged as
+        warnings) — this is fire-and-forget.  No-op if the client is not
+        connected or no session key is available.
         """
-        if not self._connected:
+        if not self._connected or not session_key:
             return
-        params: dict[str, Any] = {"agentId": agent_id}
-        if session_key:
-            params["sessionKey"] = session_key
+        params: dict[str, Any] = {"key": session_key}
         try:
             await self.request("sessions.abort", params)
             logger.info(
-                "Agent aborted: agentId=%s", agent_id,
-                extra={"event": "agent_aborted", "agent_id": agent_id},
+                "Agent aborted: sessionKey=%s", session_key,
+                extra={"event": "agent_aborted", "session_key": session_key},
             )
         except (GatewayConnectionError, GatewayRPCError) as exc:
             logger.warning(
                 "Abort may not have reached Gateway: %s", exc,
-                extra={"event": "abort_failed", "agent_id": agent_id, "error_type": type(exc).__name__},
+                extra={"event": "abort_failed", "session_key": session_key, "error_type": type(exc).__name__},
             )
 
     async def list_agents(self) -> list[dict[str, str]]:
@@ -747,14 +759,20 @@ class GatewayClient:
         *,
         event_call: Callable | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        """Handle a Gateway approval request.
+        """Handle a Gateway agent approval request.
+
+        Agent tool approvals travel in the agent event stream as
+        ``stream=="approval"`` events whose ``data`` is an
+        ``AgentApprovalEventData`` (``phase``/``kind``/``status``/``title``/
+        ``approvalId``/``command``…).  This handler resolves the approval
+        via :meth:`resolve_approval` and yields ``stream=="approval"``
+        delta events for the mapper to render as cards.
 
         Resolution depends on *mode*:
 
-        * ``auto_approve`` — resolves the approval as approved and yields
-          nothing.
-        * ``auto_deny`` — resolves as denied **and yields one delta** so
-          the user sees a "auto-denied approval for tool: X" note in chat.
+        * ``auto_approve`` — resolves as approved and yields nothing.
+        * ``auto_deny`` — resolves as denied and yields a resolved/denied
+          note so the user sees the denial in chat.
         * ``render`` — yields an approval-request card, then schedules an
           auto-deny after *timeout* seconds.
         * ``interactive`` — prompts the user via ``__event_call__``
@@ -765,57 +783,60 @@ class GatewayClient:
         In all modes the resolution is fire-and-forget
         (``asyncio.create_task``); callers should not await it.
         """
-        request = event.get("request") or event.get("payload") or event
-        tool_name = request.get("toolName") or request.get("tool") or "unknown"
+        data = event.get("data") or {}
+        approval_id = data.get("approvalId") or data.get("approvalSlug") or ""
+        kind = data.get("kind") or "unknown"
+        title = data.get("title") or "tool"
+        command = data.get("command") or ""
+
+        def _approval_delta(phase: str, status: str, **extra: Any) -> dict[str, Any]:
+            """Build a ``stream=="approval"`` delta for the mapper."""
+            payload = {"phase": phase, "status": status, "title": title, "kind": kind}
+            if command:
+                payload["command"] = command
+            payload.update(extra)
+            return {"kind": "delta", "stream": "approval", "data": payload}
 
         if mode == "auto_approve":
-            self._safe_task(self.resolve_approval(run_id, True), label="resolve_approval")
-            span.add_event("approval.auto_approved", {"tool": tool_name})
+            self._safe_task(
+                self.resolve_approval(approval_id, True, kind=kind),
+                label="resolve_approval",
+            )
+            span.add_event("approval.auto_approved", {"tool": title})
             return
 
         elif mode == "auto_deny":
-            self._safe_task(self.resolve_approval(run_id, False), label="resolve_approval")
-            span.add_event("approval.auto_denied", {"tool": tool_name})
-            yield {
-                "kind": "delta",
-                "delta": {
-                    "status": f"Auto-denied approval for tool: {tool_name}",
-                    "approval_denied": True,
-                    "toolName": tool_name,
-                },
-            }
+            self._safe_task(
+                self.resolve_approval(approval_id, False, kind=kind),
+                label="resolve_approval",
+            )
+            span.add_event("approval.auto_denied", {"tool": title})
+            yield _approval_delta("resolved", "denied")
             return
 
         elif mode == "interactive":
             if event_call is None:
                 # No back-channel available — fall back to auto-deny.
-                self._safe_task(self.resolve_approval(run_id, False), label="resolve_approval")
-                span.add_event("approval.interactive_fallback_denied",
-                               {"tool": tool_name})
-                yield {
-                    "kind": "delta",
-                    "delta": {
-                        "status": (
-                            f"Approval required for '{tool_name}' but "
-                            "interactive mode is unavailable (update Open "
-                            "WebUI for confirmation dialogs). Auto-denied."
-                        ),
-                        "approval_denied": True,
-                        "toolName": tool_name,
-                    },
-                }
+                self._safe_task(
+                    self.resolve_approval(approval_id, False, kind=kind),
+                    label="resolve_approval",
+                )
+                span.add_event("approval.interactive_fallback_denied", {"tool": title})
+                yield _approval_delta(
+                    "resolved", "denied",
+                    reason="interactive mode unavailable; auto-denied",
+                )
                 return
 
             # Prompt the user via OWUI's bidirectional event system.
-            arguments = request.get("arguments", {})
             try:
                 response = await event_call({
                     "type": "confirmation",
                     "data": {
                         "title": "Approve tool execution?",
                         "message": (
-                            f"**{tool_name}**\n\n"
-                            f"```json\n{json.dumps(arguments, indent=2)}\n```"
+                            f"**{title}**\n\n"
+                            f"```json\n{json.dumps({'command': command} if command else {}, indent=2)}\n```"
                         ),
                         "confirmText": "Approve",
                         "cancelText": "Deny",
@@ -823,59 +844,40 @@ class GatewayClient:
                 })
             except Exception:
                 # Timeout, disconnect, or other error → auto-deny.
-                span.add_event("approval.interactive_timeout",
-                               {"tool": tool_name})
-                self._safe_task(self.resolve_approval(run_id, False), label="resolve_approval")
-                yield {
-                    "kind": "delta",
-                    "delta": {
-                        "status": (
-                            f"Approval for '{tool_name}' timed out "
-                            "(auto-denied)."
-                        ),
-                        "approval_denied": True,
-                        "toolName": tool_name,
-                    },
-                }
+                span.add_event("approval.interactive_timeout", {"tool": title})
+                self._safe_task(
+                    self.resolve_approval(approval_id, False, kind=kind),
+                    label="resolve_approval",
+                )
+                yield _approval_delta("resolved", "denied", reason="timed out; auto-denied")
                 return
 
             if response:
-                self._safe_task(self.resolve_approval(run_id, True), label="resolve_approval")
-                span.add_event("approval.interactive_approved",
-                               {"tool": tool_name})
+                self._safe_task(
+                    self.resolve_approval(approval_id, True, kind=kind),
+                    label="resolve_approval",
+                )
+                span.add_event("approval.interactive_approved", {"tool": title})
             else:
-                self._safe_task(self.resolve_approval(run_id, False), label="resolve_approval")
-                span.add_event("approval.interactive_denied",
-                               {"tool": tool_name})
-                yield {
-                    "kind": "delta",
-                    "delta": {
-                        "status": f"User denied approval for tool: {tool_name}",
-                        "approval_denied": True,
-                        "toolName": tool_name,
-                    },
-                }
+                self._safe_task(
+                    self.resolve_approval(approval_id, False, kind=kind),
+                    label="resolve_approval",
+                )
+                span.add_event("approval.interactive_denied", {"tool": title})
+                yield _approval_delta("resolved", "denied", reason="user denied")
             return
 
         elif mode == "render":
-            yield {
-                "kind": "delta",
-                "delta": {
-                    "approval_request": True,
-                    "toolName": tool_name,
-                    "arguments": request.get("arguments", {}),
-                    "timeout": timeout,
-                },
-            }
+            yield _approval_delta("requested", "pending", timeout=timeout)
+
             async def _deny_after_timeout():
                 await asyncio.sleep(timeout)
                 try:
-                    await self.resolve_approval(run_id, False)
+                    await self.resolve_approval(approval_id, False, kind=kind)
                 except Exception:
                     pass
             self._safe_task(_deny_after_timeout(), label="approval_render_timeout")
-            span.add_event("approval.rendered",
-                           {"tool": tool_name, "timeout": timeout})
+            span.add_event("approval.rendered", {"tool": title, "timeout": timeout})
             return
 
         else:
@@ -885,21 +887,13 @@ class GatewayClient:
                 extra={"event": "unknown_approval_mode", "approval_mode": mode, "run_id": run_id},
             )
             self._safe_task(
-                self.resolve_approval(run_id, False),
+                self.resolve_approval(approval_id, False, kind=kind),
                 label="resolve_approval",
             )
-            span.add_event(
-                "approval.unknown_mode",
-                {"mode": mode, "tool": tool_name},
+            span.add_event("approval.unknown_mode", {"mode": mode, "tool": title})
+            yield _approval_delta(
+                "resolved", "denied", reason=f"unknown approval mode '{mode}'; auto-denied",
             )
-            yield {
-                "kind": "delta",
-                "delta": {
-                    "status": f"Unknown approval mode '{mode}'; auto-denied",
-                    "approval_denied": True,
-                    "toolName": tool_name,
-                },
-            }
 
     # ------------------------------------------------------------------
     # Response / event routing
@@ -978,15 +972,25 @@ class GatewayClient:
         payload = event.payload
 
         # Agent events are routed by runId
+        # Agent runs stream ``AgentEventPayload`` frames under the
+        # ``agent`` event name, discriminated by ``payload.stream``
+        # ("assistant"/"tool"/"item"/"approval"/"thinking"/
+        # "command_output"/"error"/"lifecycle"/…).  Route every agent
+        # event for an active run to its per-run queue.
         if event_name == "agent":
             run_id = payload.get("runId", "")
             if run_id and run_id in self._run_subscribers:
+                entry: dict[str, Any] = {"kind": "delta", "runId": run_id, **payload}
+                # Agent tool approvals travel in-stream as
+                # stream=="approval" with data.phase=="requested".  Tag
+                # them so the agent_stream consumer routes them to
+                # _handle_approval rather than rendering as a plain delta.
+                if payload.get("stream") == "approval":
+                    ap_data = payload.get("data") or {}
+                    if ap_data.get("phase") == "requested":
+                        entry["_event_type"] = "approval"
                 try:
-                    self._run_subscribers[run_id].put_nowait({
-                        "kind": "delta",
-                        "runId": run_id,
-                        **payload,
-                    })
+                    self._run_subscribers[run_id].put_nowait(entry)
                 except asyncio.QueueFull:
                     logger.warning(
                         "Run subscriber queue full for run %s; dropping delta event",
@@ -995,28 +999,11 @@ class GatewayClient:
                     )
                 return
 
-        # Only route approval.requested events per-run — other approval
-        # subtypes (resolved, timeout, …) are informational and should not
-        # trigger approval-handling logic in agent_stream.
-        if event_name == "approval.requested":
-            run_id = payload.get("runId", "")
-            if run_id and run_id in self._run_subscribers:
-                try:
-                    self._run_subscribers[run_id].put_nowait({
-                        "kind": "approval",
-                        "runId": run_id,
-                        **payload,
-                        "_event_type": "approval",
-                    })
-                except asyncio.QueueFull:
-                    logger.warning(
-                        "Run subscriber queue full for run %s; dropping approval event",
-                        run_id,
-                        extra={"event": "queue_full_drop", "run_id": run_id, "drop_type": "approval"},
-                    )
-                return
-            # No active subscriber for this runId — drop.
-            return
+        # ``exec.approval.requested`` / ``plugin.approval.requested`` events
+        # are the gateway-level exec approval path (direct system.run
+        # requests), not agent-run tool approvals — the latter arrive as
+        # ``agent`` stream=="approval" events handled above.  The Pipe only
+        # initiates agent runs, so these are intentionally not routed.
 
         # Named subscribers (legacy fanout path; currently unused).
         for queue in self._subscribers.get(event_name, []):

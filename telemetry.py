@@ -210,6 +210,30 @@ def is_enabled() -> bool:
     return _tracer is not _NOOP_TRACER
 
 
+@contextmanager
+def use_span(span: Any) -> Iterator[None]:
+    """Activate *span* as the current span for the duration of the block.
+
+    The Pipe's root ``openclaw.pipe`` span is created with ``start_span``
+    (not ``start_as_current_span``) so it can be ended manually across async
+    yields.  Without activation, child spans created by ``GatewayClient``
+    (``openclaw.gateway.connect`` / ``request:agent`` / ``agent_stream``)
+    would nest under OWUI's incoming request span instead of under
+    ``openclaw.pipe`` — fragmenting the trace.  Wrapping the request body in
+    ``with use_span(span):`` makes the root current so its children attach.
+
+    No-op when telemetry is disabled: no-op spans carry no real context and
+    there is nothing to correlate.  ``end_on_exit=False`` keeps span lifetime
+    under the caller's explicit control.
+    """
+    if not is_enabled() or not _OTEL_AVAILABLE:
+        yield
+        return
+    from opentelemetry.trace import use_span as _otel_use_span
+    with _otel_use_span(span, end_on_exit=False):
+        yield
+
+
 # ---------------------------------------------------------------------------
 # Public API — metrics instruments
 # ---------------------------------------------------------------------------

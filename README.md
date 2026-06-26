@@ -41,7 +41,7 @@ New to OpenClaw? Start with the [Gateway docs](https://docs.openclaw.ai).
 ### 2. Generate a token
 
 ```bash
-openclaw gateway token create --scopes operator.read,operator.write
+openclaw gateway token create --scopes operator.read,operator.write,operator.approvals
 ```
 
 ### 3. Install the Pipe

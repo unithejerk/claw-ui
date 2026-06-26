@@ -72,12 +72,30 @@ from __future__ import annotations
 # ---------------------------------------------------------------------------
 
 def read_module(path: Path) -> str:
-    """Read a module, strip its docstring and local imports."""
+    """Read a module, strip its docstring, local imports, and future imports."""
     source = path.read_text(encoding="utf-8")
     source = _strip_module_docstring(source)
     source = _strip_local_imports(source)
+    source = _strip_future_imports(source)
     source = re.sub(r"\n{3,}", "\n\n", source)
     return source.strip()
+
+
+def _strip_future_imports(source: str) -> str:
+    """Remove ``from __future__ import ...`` lines.
+
+    The bundle header emits a single ``from __future__ import annotations``
+    at the very top of the combined file.  Each inlined module also begins
+    with its own future import; left in place, those appear mid-file and
+    raise ``SyntaxError: from __future__ imports must occur at the beginning
+    of the file`` when the bundle is imported.  ``ast.parse`` does NOT catch
+    this (it's a compile-time rule), which is why ``--check`` previously
+    reported success for a bundle that wouldn't load.
+    """
+    return "\n".join(
+        line for line in source.split("\n")
+        if not re.match(r"^from\s+__future__\s+import\b", line.strip())
+    )
 
 
 def _strip_module_docstring(source: str) -> str:
@@ -150,10 +168,15 @@ def build_bundle() -> str:
 
 
 def verify_bundle(source: str) -> bool:
-    """Quick AST parse check."""
-    import ast
+    """Compile-check the bundle.
+
+    Uses :func:`compile` rather than ``ast.parse`` because ``ast.parse`` does
+    not enforce compile-time rules — most notably that ``from __future__``
+    imports must occur at the beginning of the file.  A bundle with a
+    mid-file future import parses fine but raises ``SyntaxError`` on load.
+    """
     try:
-        ast.parse(source)
+        compile(source, "<bundle>", "exec")
         return True
     except SyntaxError as exc:
         print(f"❌ Bundle syntax error: {exc}", file=sys.stderr)

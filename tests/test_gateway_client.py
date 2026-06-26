@@ -35,15 +35,21 @@ class FeedClient(GatewayClient):
         super().__init__("ws://x", "tok", request_timeout=2.0)
         self._connected = True
         self.approvals = []
+        self.agent_request_params = None  # params the real agent_stream built
 
     async def connect(self):
         pass
 
     async def request(self, method, params=None, *, idempotent=False):
+        # Capture the params the real GatewayClient.agent_stream constructs so
+        # tests can assert they conform to AgentParamsSchema (not just that
+        # build_request formats them).
+        if method == "agent":
+            self.agent_request_params = dict(params or {})
         return {"status": "accepted", "runId": "run-1"}
 
-    async def resolve_approval(self, run_id, approved):
-        self.approvals.append((run_id, approved))
+    async def resolve_approval(self, approval_id, approved, *, kind="exec"):
+        self.approvals.append((approval_id, approved, kind))
 
 
 # ── Routing: agent deltas routed per-run (#3 baseline) ────────────────────
@@ -52,32 +58,47 @@ def test_route_event_agent_delta_routed_by_runid():
     c = RoutingClient()
     q = asyncio.Queue()
     c._run_subscribers["run-1"] = q
-    c._route_event(EventFrame(event="agent", payload={"runId": "run-1", "delta": {"content": "hi"}}))
+    c._route_event(EventFrame(event="agent", payload={
+        "runId": "run-1", "stream": "assistant", "data": {"delta": "hi"},
+    }))
     ev = q.get_nowait()
     assert ev["kind"] == "delta"
     assert ev["runId"] == "run-1"
-    assert ev["delta"]["content"] == "hi"
+    assert ev["stream"] == "assistant"
+    assert ev["data"]["delta"] == "hi"
 
 
 def test_route_event_unknown_runid_dropped():
     c = RoutingClient()
-    c._route_event(EventFrame(event="agent", payload={"runId": "nope", "delta": {}}))
+    c._route_event(EventFrame(event="agent", payload={
+        "runId": "nope", "stream": "assistant", "data": {},
+    }))
     assert c._run_subscribers == {}  # nothing registered, no error
 
 
 # ── Routing: approvals routed per-run, no cross-wire (#3 regression) ───────
+# Agent tool approvals travel in the agent event stream as stream=="approval"
+# with data.phase=="requested"; _route_event tags them _event_type="approval".
+
+def _approval_payload(run_id, *, approval_id="ap-1", title="web_search"):
+    return {
+        "runId": run_id, "stream": "approval",
+        "data": {"phase": "requested", "status": "pending", "title": title,
+                 "kind": "exec", "approvalId": approval_id},
+    }
+
 
 def test_route_event_approval_tagged_and_per_run():
     c = RoutingClient()
     q = asyncio.Queue()
     c._run_subscribers["run-1"] = q
-    c._route_event(EventFrame(event="approval.requested", payload={
-        "runId": "run-1", "request": {"toolName": "web_search", "arguments": {"q": "x"}}
-    }))
+    c._route_event(EventFrame(event="agent", payload=_approval_payload("run-1")))
     ev = q.get_nowait()
     assert ev["_event_type"] == "approval"
-    assert ev["kind"] == "approval"
+    assert ev["kind"] == "delta"
     assert ev["runId"] == "run-1"
+    assert ev["stream"] == "approval"
+    assert ev["data"]["approvalId"] == "ap-1"
 
 
 def test_route_event_approval_does_not_cross_wire_to_other_run():
@@ -87,17 +108,14 @@ def test_route_event_approval_does_not_cross_wire_to_other_run():
     q_b = asyncio.Queue()
     c._run_subscribers["run-A"] = q_a
     c._run_subscribers["run-B"] = q_b
-    c._route_event(EventFrame(event="approval.requested", payload={
-        "runId": "run-A", "request": {"toolName": "t"}
-    }))
-    assert not q_b.empty() is False  # B's queue is empty
+    c._route_event(EventFrame(event="agent", payload=_approval_payload("run-A", title="t")))
     assert q_b.empty()
     assert not q_a.empty()  # A's queue got it
 
 
 def test_route_event_approval_for_unknown_run_dropped():
     c = RoutingClient()
-    c._route_event(EventFrame(event="approval.requested", payload={"runId": "ghost"}))
+    c._route_event(EventFrame(event="agent", payload=_approval_payload("ghost")))
     assert c._run_subscribers == {}
 
 
@@ -140,16 +158,53 @@ async def _feed(c, run_id, events, delay=0.0):
 async def test_agent_stream_yields_deltas_and_final():
     c = FeedClient()
     feeder = asyncio.create_task(_feed(c, "run-1", [
-        {"kind": "delta", "delta": {"content": "Hel"}},
-        {"kind": "delta", "delta": {"content": "lo"}},
+        {"kind": "delta", "stream": "assistant", "data": {"delta": "Hel"}},
+        {"kind": "delta", "stream": "assistant", "data": {"delta": "lo"}},
         {"kind": "final", "status": "ok", "runId": "run-1"},
     ]))
     out = []
-    async for ev in c.agent_stream("default", [{"role": "user", "content": "hi"}], "sess"):
+    async for ev in c.agent_stream("default", "hi", "sess"):
         out.append(ev.get("kind"))
     await feeder
     assert out == ["delta", "delta", "final"]
     assert "run-1" not in c._run_subscribers  # cleaned up
+
+
+async def test_agent_stream_builds_v4_schema_valid_params():
+    """The real GatewayClient.agent_stream must build params that conform to
+    AgentParamsSchema: a single `message` string, `extraSystemPrompt`/
+    `attachments` (not systemPrompt/files), and no OAI model params or tools.
+    The idempotencyKey is added by build_request (tested in conformance)."""
+    from openclaw_pipe import _extract_agent_message, _extract_system_prompt
+
+    c = FeedClient()
+    body = {
+        "messages": [
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "Hello"},
+        ],
+        "temperature": 0.7,  # must NOT be forwarded
+    }
+    feeder = asyncio.create_task(_feed(c, "run-1", [
+        {"kind": "final", "status": "ok", "runId": "run-1"},
+    ]))
+    async for _ in c.agent_stream("default", _extract_agent_message(body),
+                                   "sess",
+                                   extra_system_prompt=_extract_system_prompt(body)):
+        pass
+    await feeder
+
+    assert c.agent_request_params is not None
+    p = c.agent_request_params
+    assert p.get("agentId") == "default"
+    assert p.get("message") == "Hello"          # single string, not messages[]
+    assert p.get("extraSystemPrompt") == "be brief"  # not systemPrompt
+    assert p.get("sessionKey") == "sess"
+    # Forbidden legacy / OAI fields must not be forwarded.
+    for forbidden in ("messages", "systemPrompt", "files", "tools",
+                      "temperature", "top_p", "max_tokens", "reasoning_effort",
+                      "response_format"):
+        assert forbidden not in p, f"{forbidden} must not be forwarded to agent RPC"
 
 
 async def test_agent_stream_timeout_raises_rpc_error():
@@ -161,7 +216,7 @@ async def test_agent_stream_timeout_raises_rpc_error():
 
     feeder = asyncio.create_task(never_feed())
     with pytest.raises(GatewayRPCError):
-        async for _ in c.agent_stream("default", [{"role": "user", "content": "hi"}], "sess"):
+        async for _ in c.agent_stream("default", "hi", "sess"):
             pass
     feeder.cancel()
     assert "run-1" not in c._run_subscribers  # cleaned up even on timeout
@@ -169,38 +224,50 @@ async def test_agent_stream_timeout_raises_rpc_error():
 
 # ── Approval handling end-to-end ───────────────────────────────────────────
 
+def _approval_queue_event(run_id, *, approval_id="ap-1", title="web_search"):
+    """An approval-requested event as it reaches the agent_stream consumer
+    queue (tagged _event_type="approval" by _route_event)."""
+    return {
+        "kind": "delta", "_event_type": "approval", "runId": run_id,
+        "stream": "approval",
+        "data": {"phase": "requested", "status": "pending", "title": title,
+                 "kind": "exec", "approvalId": approval_id},
+    }
+
+
 async def test_approval_auto_deny_yields_denial_and_resolves_false():
     c = FeedClient()
     feeder = asyncio.create_task(_feed(c, "run-1", [
-        {"kind": "approval", "_event_type": "approval", "runId": "run-1",
-         "request": {"toolName": "web_search", "arguments": {"q": "x"}}},
+        _approval_queue_event("run-1"),
         {"kind": "final", "status": "ok", "runId": "run-1"},
     ]))
     out = []
-    async for ev in c.agent_stream("default", [{"role": "user", "content": "hi"}], "sess",
+    async for ev in c.agent_stream("default", "hi", "sess",
                                     approval_mode="auto_deny", approval_timeout=1):
         out.append(ev)
     await feeder
     await asyncio.sleep(0.05)  # let fire-and-forget resolve_approval drain
-    # The auto_deny branch yields one status delta, then the final.
-    assert ("run-1", False) in c.approvals
+    # auto_deny resolves the approval as denied (decision="deny").
+    assert ("ap-1", False, "exec") in c.approvals
+    # The auto_deny branch yields a resolved/denied approval delta, then final.
+    assert any(ev.get("stream") == "approval" and ev.get("data", {}).get("status") == "denied"
+               for ev in out)
 
 
 async def test_approval_auto_approve_resolves_true_and_yields_nothing():
     c = FeedClient()
     feeder = asyncio.create_task(_feed(c, "run-1", [
-        {"kind": "approval", "_event_type": "approval", "runId": "run-1",
-         "request": {"toolName": "t", "arguments": {}}},
+        _approval_queue_event("run-1", title="t"),
         {"kind": "final", "status": "ok", "runId": "run-1"},
     ]))
     out = []
-    async for ev in c.agent_stream("default", [{"role": "user", "content": "hi"}], "sess",
+    async for ev in c.agent_stream("default", "hi", "sess",
                                     approval_mode="auto_approve", approval_timeout=1):
         out.append(ev)
     await feeder
     await asyncio.sleep(0.05)
-    # auto_approve yields nothing for the approval; only the final is yielded.
-    assert ("run-1", True) in c.approvals
+    # auto_approve resolves as approved (decision="allow-once"), yields nothing.
+    assert ("ap-1", True, "exec") in c.approvals
     assert len(out) == 1 and out[0].get("kind") == "final"
 
 
@@ -214,7 +281,8 @@ async def test_agent_stream_does_not_leak_tasks_across_many_events():
     c._request_timeout = 5.0
 
     n_events = 2000
-    events = [{"kind": "delta", "delta": {"content": "x"}} for _ in range(n_events)]
+    events = [{"kind": "delta", "stream": "assistant", "data": {"delta": "x"}}
+              for _ in range(n_events)]
     events.append({"kind": "final", "status": "ok", "runId": "run-1"})
 
     feeder = asyncio.create_task(_feed(c, "run-1", events))
@@ -224,7 +292,7 @@ async def test_agent_stream_does_not_leak_tasks_across_many_events():
     baseline = len(asyncio.all_tasks())
 
     count = 0
-    async for _ in c.agent_stream("default", [{"role": "user", "content": "hi"}], "sess"):
+    async for _ in c.agent_stream("default", "hi", "sess"):
         count += 1
     await feeder
     await asyncio.sleep(0)  # let any done callbacks settle
@@ -313,8 +381,8 @@ async def test_handle_approval_unknown_mode_auto_denies():
 
     approvals = []
 
-    async def fake_resolve(run_id, approved):
-        approvals.append((run_id, approved))
+    async def fake_resolve(approval_id, approved, *, kind="exec"):
+        approvals.append((approval_id, approved, kind))
 
     c.resolve_approval = fake_resolve
 
@@ -327,8 +395,10 @@ async def test_handle_approval_unknown_mode_auto_denies():
     span = _FakeSpan()
 
     event = {
-        "request": {"toolName": "web_search", "arguments": {"q": "x"}},
         "runId": "run-1",
+        "stream": "approval",
+        "data": {"phase": "requested", "status": "pending", "title": "web_search",
+                 "kind": "exec", "approvalId": "ap-1"},
     }
 
     results = []
@@ -337,12 +407,13 @@ async def test_handle_approval_unknown_mode_auto_denies():
 
     assert len(results) == 1
     assert results[0]["kind"] == "delta"
-    assert results[0]["delta"]["approval_denied"] is True
-    assert "bogus" in results[0]["delta"]["status"]
+    assert results[0]["stream"] == "approval"
+    assert results[0]["data"]["status"] == "denied"
+    assert "bogus" in results[0]["data"]["reason"]
 
     # Let the fire-and-forget _safe_task complete
     await asyncio.sleep(0.05)
-    assert ("run-1", False) in approvals
+    assert ("ap-1", False, "exec") in approvals
 
 
 # ── Bounded queue (QueueFull) ──────────────────────────────────────────────
@@ -356,7 +427,7 @@ def test_route_event_queue_full_agent_delta_handled_gracefully():
     # Must not crash when the queue is full — logs a warning instead.
     c._route_event(EventFrame(
         event="agent",
-        payload={"runId": "run-1", "delta": {"content": "hello"}},
+        payload={"runId": "run-1", "stream": "assistant", "data": {"delta": "hello"}},
     ))
 
     assert q.qsize() == 1  # original item unchanged
@@ -369,8 +440,8 @@ def test_route_event_queue_full_approval_handled_gracefully():
     c._run_subscribers["run-1"] = q
 
     c._route_event(EventFrame(
-        event="approval.requested",
-        payload={"runId": "run-1", "request": {"toolName": "web_search"}},
+        event="agent",
+        payload=_approval_payload("run-1"),
     ))
 
     assert q.qsize() == 1

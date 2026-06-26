@@ -44,6 +44,50 @@ def test_bundle_output_flag_writes_file(tmp_path):
     assert "from __future__ import annotations" in content
 
 
+def test_bundle_imports_and_runs_in_isolation(tmp_path):
+    """The generated bundle must be self-contained: importable with the repo
+    NOT on sys.path, and the inlined Pipe must instantiate and answer
+    pipes().
+
+    Regression for the bundler bug where each inlined module kept its own
+    ``from __future__ import annotations`` mid-file, so the bundle parsed
+    (``ast.parse``) but raised ``SyntaxError`` on import.  ``--check`` used
+    ``ast.parse`` and missed it; this test imports the bundle for real.
+    """
+    import textwrap
+    out = tmp_path / "bundle.py"
+    _run_install("-o", str(out), expect_code=0)
+
+    # Import in a subprocess whose cwd is NOT the repo and whose sys.path
+    # excludes the repo, so top-level packages (valves, protocol, …) only
+    # resolve from inside the bundle.
+    probe = tmp_path / "probe.py"
+    probe.write_text(textwrap.dedent("""
+        import sys
+        assert not any("claw-ui" in p for p in sys.path), "repo must not be on sys.path"
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("openclaw_bundle", r"{bundle}")
+        m = importlib.util.module_from_spec(spec)
+        # Register before exec: @dataclass / pydantic resolve the defining
+        # module via sys.modules[cls.__module__]; exec_module alone doesn't
+        # register it.  This mirrors how OWUI's function loader operates.
+        sys.modules["openclaw_bundle"] = m
+        spec.loader.exec_module(m)
+        p = m.Pipe()
+        models = p.pipes()
+        assert models and models[0]["id"].startswith("openclaw/")
+        print("OK", len(models))
+    """).format(bundle=str(out).replace("\\", "\\\\")))
+    r = subprocess.run(
+        [sys.executable, str(probe)],
+        capture_output=True, text=True, timeout=30, cwd=str(tmp_path),
+    )
+    assert r.returncode == 0, (
+        f"isolated bundle import failed:\nstdout:{r.stdout}\nstderr:{r.stderr}"
+    )
+    assert "OK" in r.stdout
+
+
 # ── CLI validation ───────────────────────────────────────────────────────────
 
 

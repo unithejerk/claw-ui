@@ -111,10 +111,10 @@ async def main() -> None:
             "minProtocol": PROTOCOL_VERSION,
             "maxProtocol": PROTOCOL_VERSION,
             "client": {
-                "id": "openwebui-pipe",
+                "id": "gateway-client",
                 "version": "1.0.0",
                 "platform": "open-webui",
-                "mode": "interactive",
+                "mode": "cli",
             },
             "role": "operator",
             "scopes": ["operator.read", "operator.write"],

@@ -4,11 +4,11 @@ import base64
 import openclaw_pipe
 from openclaw_pipe import (
     _build_session_key,
+    _coerce_text,
     _error_chunk,
     _error_stream_generator,
+    _extract_agent_message,
     _extract_file_payloads,
-    _extract_messages,
-    _extract_model_params,
     _extract_system_prompt,
     _parse_agent_id,
 )
@@ -54,39 +54,54 @@ def test_session_key_switching_agent_isolates():
     assert a != b
 
 
-# ── _extract_messages ─────────────────────────────────────────────────────
+# ── _extract_agent_message ─────────────────────────────────────────────────
 
-def test_extract_messages_last_only_returns_last_user():
+def test_extract_agent_message_last_only_returns_last_user():
     msgs = [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "first"},
         {"role": "assistant", "content": "reply"},
         {"role": "user", "content": "second"},
     ]
-    assert _extract_messages({"messages": msgs}, mode="last") == [{"role": "user", "content": "second"}]
+    assert _extract_agent_message({"messages": msgs}, mode="last") == "second"
 
 
-def test_extract_messages_last_no_user_falls_back_to_last():
+def test_extract_agent_message_last_no_user_falls_back_to_last():
     msgs = [{"role": "assistant", "content": "x"}]
-    assert _extract_messages({"messages": msgs}, mode="last") == [{"role": "assistant", "content": "x"}]
+    assert _extract_agent_message({"messages": msgs}, mode="last") == "x"
 
 
-def test_extract_messages_full_returns_all():
+def test_extract_agent_message_full_flattens_transcript():
     msgs = [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}]
-    assert _extract_messages({"messages": msgs}, mode="full") == msgs
+    assert _extract_agent_message({"messages": msgs}, mode="full") == "user: a\nassistant: b"
 
 
-# ── _extract_model_params ─────────────────────────────────────────────────
-
-def test_extract_model_params_filters_known_and_skips_none():
-    body = {"temperature": 0.7, "max_tokens": 100, "stop": None, "junk": 1}
-    params = _extract_model_params(body)
-    assert params == {"temperature": 0.7, "max_tokens": 100}
-    assert "stop" not in params
-    assert "junk" not in params
+def test_extract_agent_message_empty_when_no_messages():
+    assert _extract_agent_message({}) == ""
 
 
-# ── _extract_system_prompt ────────────────────────────────────────────────
+def test_extract_agent_message_coerces_content_parts():
+    # OWUI may send content as a list of parts.
+    msgs = [{"role": "user", "content": [{"type": "text", "text": "hi "}, {"type": "text", "text": "there"}]}]
+    assert _extract_agent_message({"messages": msgs}) == "hi there"
+
+
+# ── _coerce_text ───────────────────────────────────────────────────────────
+
+def test_coerce_text_string_passthrough():
+    assert _coerce_text("hi") == "hi"
+
+
+def test_coerce_text_parts_concatenated():
+    assert _coerce_text([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]) == "ab"
+
+
+def test_coerce_text_none_and_other():
+    assert _coerce_text(None) == ""
+    assert _coerce_text(42) == "42"
+
+
+# ── _extract_system_prompt ─────────────────────────────────────────────────
 
 def test_extract_system_prompt_found():
     msgs = [{"role": "user", "content": "hi"}, {"role": "system", "content": "be brief"}]
@@ -97,7 +112,7 @@ def test_extract_system_prompt_none():
     assert _extract_system_prompt({"messages": [{"role": "user", "content": "hi"}]}) is None
 
 
-# ── _extract_file_payloads ────────────────────────────────────────────────
+# ── _extract_file_payloads ─────────────────────────────────────────────────
 
 def test_extract_file_payloads_none_when_empty():
     assert _extract_file_payloads(None) is None

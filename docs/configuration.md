@@ -16,7 +16,7 @@ Click the gear icon next to the Pipe name.
 | Valve | Default | Description |
 |---|---|---|
 | `GATEWAY_URL` | `ws://127.0.0.1:18789` | WebSocket URL of the OpenClaw Gateway. Change if Gateway runs on a different host or port. |
-| `GATEWAY_TOKEN` | _(empty)_ | Authentication token for Gateway operator access. Must be a valid token with `operator.read` and `operator.write` scopes. |
+| `GATEWAY_TOKEN` | _(empty)_ | Authentication token for Gateway operator access. Must be a valid token with `operator.read`, `operator.write`, and `operator.approvals` scopes. |
 | `AGENT_PREFIX` | `OpenClaw/` | Prefix shown before each agent name in the model selector. |
 | `AGENT_LIST` | `__auto__` | Comma-separated agent IDs (e.g. `"default,coding"`) or `__auto__` for discovery via Gateway RPC. |
 | `REQUEST_TIMEOUT` | `120` | Maximum seconds to wait for an agent run. Gateway will abort the run if exceeded. Range: 10–600. |
@@ -61,6 +61,7 @@ runbook for token generation (`openclaw gateway token create` or equivalent).
 The token needs at minimum:
 - `operator.read`
 - `operator.write`
+- `operator.approvals` (required to resolve agent tool approvals)
 
 ### 3. Firewall
 
@@ -97,7 +98,7 @@ reports.
 
 - Verify `GATEWAY_TOKEN` is set and valid.
 - Check the Gateway logs for auth failures.
-- Ensure the token has `operator.read` and `operator.write` scopes.
+- Ensure the token has `operator.read`, `operator.write`, and `operator.approvals` scopes.
 
 ### "Agent run timed out"
 
@@ -117,7 +118,7 @@ This is expected.  Open WebUI renders `<details type="tool_calls">` blocks
 as expandable cards.  If you see raw HTML instead:
 - Ensure the Pipe is yielding the HTML string as an SSE chunk (not wrapping
   it in `delta.content`).
-- Check that `event_mapper._render_tool_call` is returning a plain string,
+- Check that `event_mapper._render_item` is returning a plain string,
   not a dict.
 
 ## OpenTelemetry tracing
